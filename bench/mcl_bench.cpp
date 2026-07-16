@@ -188,11 +188,13 @@ int main() {
 	CDDTCast cddt(map, max_range_px, THETA_DISCRETIZATION);
 	CDDTCast pcddt(map, max_range_px, THETA_DISCRETIZATION);
 	pcddt.prune(max_range_px);
+	GiantLUTCast glt(map, max_range_px, THETA_DISCRETIZATION);
 
 	bl.set_sensor_model(sensor_table.data(), table_width);
 	rm.set_sensor_model(sensor_table.data(), table_width);
 	cddt.set_sensor_model(sensor_table.data(), table_width);
 	pcddt.set_sensor_model(sensor_table.data(), table_width);
+	glt.set_sensor_model(sensor_table.data(), table_width);
 
 	std::mt19937 rng(42);
 
@@ -208,11 +210,13 @@ int main() {
 	run_sweep("rm", rm, map, sweep_60, angles_60, rng);
 	run_sweep("cddt", cddt, map, sweep_60, angles_60, rng);
 	run_sweep("pcddt", pcddt, map, sweep_60, angles_60, rng);
+	run_sweep("glt", glt, map, sweep_60, angles_60, rng);
 
 	run_sweep("bl", bl, map, sweep_1080, angles_1080, rng);
 	run_sweep("rm", rm, map, sweep_1080, angles_1080, rng);
 	run_sweep("cddt", cddt, map, sweep_1080, angles_1080, rng);
 	run_sweep("pcddt", pcddt, map, sweep_1080, angles_1080, rng);
+	run_sweep("glt", glt, map, sweep_1080, angles_1080, rng);
 
 	return 0;
 }

@@ -36,6 +36,12 @@ endif()
 
 target_link_libraries(mcl_bench pthread)
 
+# LUT-only rerun of the same sweep (see mcl_bench_lut.cpp) so adding GiantLUTCast's numbers
+# doesn't require redoing the bl/rm/cddt/pcddt sweeps already collected.
+add_executable(mcl_bench_lut mcl_bench_lut.cpp
+    ${RANGE_LIBC_DIR}/vendor/lodepng/lodepng.cpp)
+target_link_libraries(mcl_bench_lut pthread)
+
 # separate diagnostic tool: measures k (RayMarching dependent-hop count per ray), not timing.
 # its own target so the COUNT_RM_HOPS instrumentation never touches mcl_bench's hot path.
 add_executable(k_hops k_hops.cpp
