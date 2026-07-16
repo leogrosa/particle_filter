@@ -1,2 +1,4 @@
 *.pyc
 ._*
+bench/build/
+bench/k_hops_samples.csv
