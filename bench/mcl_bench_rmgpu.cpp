@@ -1,5 +1,6 @@
 #include "range_libc/includes/RangeLib.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -134,7 +135,20 @@ static PhaseTimes bench_point(RayMarchingGPU &range_method, RayMarching &obs_sou
         }
         auto t2 = Clock::now();
 
-        range_method.numpy_calc_range_angles(proposal.data(), angles.data(), ranges.data(), max_particles, num_rays);
+        // RayMarchingGPU::numpy_calc_range_angles (range_libc, not modified here) internally
+        // splits large calls into CHUNK_SIZE-sized pieces using particles_per_iter =
+        // ceil(CHUNK_SIZE/num_rays) -- that ceil can make particles_per_iter*num_rays exceed
+        // CHUNK_SIZE (e.g. CHUNK_SIZE=262144, num_rays=60 -> ceil gives 4370, 4370*60=262200),
+        // overflowing its device output buffer once it has to split at all (confirmed: a real
+        // cudaErrorInvalidValue on Jetson at max_particles=8000, num_rays=60). Calling it here in
+        // batches that never force that internal split (each batch's own particle*ray count safely
+        // under CHUNK_SIZE) sidesteps the bug without touching range_libc, which the real
+        // mit-racecar Python node also depends on.
+        const int safe_batch = std::max(1, CHUNK_SIZE / num_rays);
+        for (int off = 0; off < max_particles; off += safe_batch) {
+            int n = std::min(safe_batch, max_particles - off);
+            range_method.numpy_calc_range_angles(&proposal[off * 3], angles.data(), &ranges[off * num_rays], n, num_rays);
+        }
         auto t2b = Clock::now();
 
         // eval_sensor_model lives in the RangeMethod base class (RangeLib.h:533), inherited by
