@@ -23,8 +23,15 @@ NOISY_REL_STDEV = 0.15  # flag a point if stdev exceeds this fraction of the mea
 
 
 def run_once(binary, seed, timeout):
+    # stdout/stderr=PIPE + universal_newlines, not capture_output/text -- the Jetson's stock
+    # Python is 3.6, and both of those kwargs were only added in 3.7.
     result = subprocess.run(
-        [binary, str(seed)], capture_output=True, text=True, check=True, timeout=timeout
+        [binary, str(seed)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        check=True,
+        timeout=timeout,
     )
     return result.stdout
 
