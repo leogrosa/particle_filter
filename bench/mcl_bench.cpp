@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <random>
+#include <string>
 #include <vector>
 
 using namespace ranges;
@@ -172,12 +173,57 @@ static std::vector<float> make_angles(int n) {
 	return a;
 }
 
+static void print_usage(const char *prog) {
+	std::fprintf(stderr,
+		"usage: %s --method NAME --rays N --particles N [--seed N]\n"
+		"  --method     one of: bl, rm, cddt, pcddt, glt\n"
+		"  --rays       number of LIDAR rays (e.g. 60 or 1080)\n"
+		"  --particles  particle count for this single data point\n"
+		"  --seed       RNG seed (default 42)\n"
+		"\n"
+		"Runs exactly one (method, rays, particles) point and prints one CSV row (with\n"
+		"header). Previously this binary ran the whole method x rays x particle-count\n"
+		"sweep internally in one call, which meant one subprocess invocation (from\n"
+		"bench_stats.py) could run for 10+ minutes with no way to bound or skip any\n"
+		"single slow point -- RM's 1080-ray sweep hit that wall. Now each invocation is\n"
+		"one point, so bench_stats.py --points-mode can apply a timeout per particle\n"
+		"count and stop growing a sweep once it's clearly over budget, instead of one\n"
+		"global timeout over everything.\n",
+		prog);
+}
+
 int main(int argc, char **argv) {
-	// Seed is a CLI arg (default 42) rather than hardcoded -- see mcl_bench_rmgpu.cpp's main()
-	// and rmgpu_stats.py for why: RM's per-ray marching step count is data-dependent, so a single
-	// seed's sweep can show non-monotonic timing purely from which map regions got sampled.
 	unsigned int seed = 42;
-	if (argc > 1) seed = (unsigned int)std::atoi(argv[1]);
+	std::string method_name;
+	int num_rays = -1;
+	int max_particles = -1;
+
+	for (int i = 1; i < argc; ++i) {
+		std::string arg = argv[i];
+		if (arg == "-h" || arg == "--help") {
+			print_usage(argv[0]);
+			return 0;
+		}
+		if (i + 1 >= argc) {
+			std::fprintf(stderr, "%s requires a value\n", arg.c_str());
+			print_usage(argv[0]);
+			return 1;
+		}
+		const char *value = argv[++i];
+		if (arg == "--seed") seed = (unsigned int)std::atoi(value);
+		else if (arg == "--method") method_name = value;
+		else if (arg == "--rays") num_rays = std::atoi(value);
+		else if (arg == "--particles") max_particles = std::atoi(value);
+		else {
+			std::fprintf(stderr, "unknown argument: %s\n", arg.c_str());
+			print_usage(argv[0]);
+			return 1;
+		}
+	}
+	if (method_name.empty() || num_rays <= 0 || max_particles <= 0) {
+		print_usage(argv[0]);
+		return 1;
+	}
 
 	OMap map(QUOTE(MAP_PATH));
 	if (map.error()) {
@@ -190,40 +236,40 @@ int main(int argc, char **argv) {
 	const int table_width = max_range_px + 1;
 	std::vector<double> sensor_table = build_sensor_model_table(table_width);
 
-	BresenhamsLine bl(map, max_range_px);
-	RayMarching rm(map, max_range_px);
-	CDDTCast cddt(map, max_range_px, THETA_DISCRETIZATION);
-	CDDTCast pcddt(map, max_range_px, THETA_DISCRETIZATION);
-	pcddt.prune(max_range_px);
-	GiantLUTCast glt(map, max_range_px, THETA_DISCRETIZATION);
-
-	bl.set_sensor_model(sensor_table.data(), table_width);
-	rm.set_sensor_model(sensor_table.data(), table_width);
-	cddt.set_sensor_model(sensor_table.data(), table_width);
-	pcddt.set_sensor_model(sensor_table.data(), table_width);
-	glt.set_sensor_model(sensor_table.data(), table_width);
-
 	std::mt19937 rng(seed);
-
-	std::vector<float> angles_60 = make_angles(60);
-	std::vector<float> angles_1080 = make_angles(1080);
-
-	const std::vector<int> sweep_60 = {500, 1000, 2000, 4000, 8000, 11700, 16000, 24000, 32000, 50000, 75000, 100000};
-	const std::vector<int> sweep_1080 = {100, 300, 650, 1000, 2000};
+	std::vector<float> angles = make_angles(num_rays);
+	const std::vector<int> one_point = {max_particles};
 
 	std::printf("method,max_particles,num_rays,iters_per_sec,ms_total,ms_resample,ms_motion,ms_range_sensor,ms_normalize\n");
 
-	run_sweep("bl", bl, map, sweep_60, angles_60, rng);
-	run_sweep("rm", rm, map, sweep_60, angles_60, rng);
-	run_sweep("cddt", cddt, map, sweep_60, angles_60, rng);
-	run_sweep("pcddt", pcddt, map, sweep_60, angles_60, rng);
-	run_sweep("glt", glt, map, sweep_60, angles_60, rng);
-
-	run_sweep("bl", bl, map, sweep_1080, angles_1080, rng);
-	run_sweep("rm", rm, map, sweep_1080, angles_1080, rng);
-	run_sweep("cddt", cddt, map, sweep_1080, angles_1080, rng);
-	run_sweep("pcddt", pcddt, map, sweep_1080, angles_1080, rng);
-	run_sweep("glt", glt, map, sweep_1080, angles_1080, rng);
+	// Only construct the requested method -- a caller sweeping "rm" across many particle counts
+	// shouldn't also pay CDDT's trace-table build, PCDDT's prune(), or GiantLUTCast's giant_lut
+	// precompute on every single invocation.
+	if (method_name == "bl") {
+		BresenhamsLine bl(map, max_range_px);
+		bl.set_sensor_model(sensor_table.data(), table_width);
+		run_sweep("bl", bl, map, one_point, angles, rng);
+	} else if (method_name == "rm") {
+		RayMarching rm(map, max_range_px);
+		rm.set_sensor_model(sensor_table.data(), table_width);
+		run_sweep("rm", rm, map, one_point, angles, rng);
+	} else if (method_name == "cddt") {
+		CDDTCast cddt(map, max_range_px, THETA_DISCRETIZATION);
+		cddt.set_sensor_model(sensor_table.data(), table_width);
+		run_sweep("cddt", cddt, map, one_point, angles, rng);
+	} else if (method_name == "pcddt") {
+		CDDTCast pcddt(map, max_range_px, THETA_DISCRETIZATION);
+		pcddt.prune(max_range_px);
+		pcddt.set_sensor_model(sensor_table.data(), table_width);
+		run_sweep("pcddt", pcddt, map, one_point, angles, rng);
+	} else if (method_name == "glt") {
+		GiantLUTCast glt(map, max_range_px, THETA_DISCRETIZATION);
+		glt.set_sensor_model(sensor_table.data(), table_width);
+		run_sweep("glt", glt, map, one_point, angles, rng);
+	} else {
+		std::fprintf(stderr, "unknown method: %s (expected bl, rm, cddt, pcddt, or glt)\n", method_name.c_str());
+		return 1;
+	}
 
 	return 0;
 }
