@@ -69,9 +69,24 @@ static void sample_free_particles(OMap &map, std::vector<float> &particles, int 
 
 struct PhaseTimes {
     double resample_ms = 0, motion_ms = 0, range_sensor_ms = 0, normalize_ms = 0, total_ms = 0;
+    double gpu_range_ms = 0;  // sub-split of range_sensor_ms: numpy_calc_range_angles (GPU) only,
+                              // excludes the CPU sensor-table accumulate step (see bench_point).
 };
 
-// RayMarchingGPU::calc_range is deliberately disabled (batched-only, see RangeLib.h) -- the
+// RayMarchingGPU::calc_range_repeat_angles_eval_sensor_model is an unimplemented stub upstream --
+// it prints "Do not use ... unimplemented" and returns without touching weights (kernels.cu:281-315,
+// the real body is commented out and was never finished, including the never-written
+// cuda_accumulate_weights kernel). The library's own .pyx wrapper pairs two other, real methods
+// instead: numpy_calc_range_angles (a complete GPU kernel, RangeLib.h:855) for ranges, then
+// eval_sensor_model (RangeLib.h:533, base RangeMethod class, CPU) for the weight accumulate --
+// used here as-is, not reimplemented. gpu_range_ms times only the first call, so it's directly
+// comparable to the RangeLibc doc's own 18-28M queries/sec figures (which are raw calc_range /
+// numpy_calc_range_angles numbers, not a fused-with-sensor-model rate -- confirmed by reading the
+// doc's own Performance Comparison table). range_sensor_ms (gpu_range_ms + the eval_sensor_model
+// call) has no equivalent published number to compare against -- it's a first measurement of the
+// full pipeline's real cost given the library's own incomplete GPU implementation.
+//
+// RayMarchingGPU::calc_range is also deliberately disabled (batched-only, see RangeLib.h) -- the
 // synthetic observation is generated with a CPU RayMarching instance instead. Timing doesn't
 // depend on the observed values, only on exercising the real eval_sensor_model code path (same
 // rationale as mcl_bench.cpp's bench_point).
@@ -84,6 +99,7 @@ static PhaseTimes bench_point(RayMarchingGPU &range_method, RayMarching &obs_sou
     std::vector<float> proposal(max_particles * 3);
     std::vector<double> new_weights(max_particles);
     std::vector<int> proposal_indices(max_particles);
+    std::vector<float> ranges(max_particles * num_rays);
 
     sample_free_particles(map, particles, max_particles, rng);
 
@@ -118,8 +134,15 @@ static PhaseTimes bench_point(RayMarchingGPU &range_method, RayMarching &obs_sou
         }
         auto t2 = Clock::now();
 
-        range_method.calc_range_repeat_angles_eval_sensor_model(proposal.data(), angles.data(), obs.data(),
-                                                                  new_weights.data(), max_particles, num_rays);
+        range_method.numpy_calc_range_angles(proposal.data(), angles.data(), ranges.data(), max_particles, num_rays);
+        auto t2b = Clock::now();
+
+        // eval_sensor_model lives in the RangeMethod base class (RangeLib.h:533), inherited by
+        // RayMarchingGPU unchanged -- CPU-only, uses map.world_scale and the sensor_model member
+        // populated by RayMarchingGPU's own set_sensor_model override (RangeLib.h:878). This is
+        // the exact function the library's own .pyx Cython wrapper pairs with
+        // numpy_calc_range_angles for GPU sensor evaluation -- not a hand-rolled duplicate.
+        range_method.eval_sensor_model(obs.data(), ranges.data(), new_weights.data(), num_rays, max_particles);
         auto t3 = Clock::now();
 
         double wsum = 0.0;
@@ -131,6 +154,7 @@ static PhaseTimes bench_point(RayMarchingGPU &range_method, RayMarching &obs_sou
         if (iter >= WARMUP_ITERS) {
             sum.resample_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
             sum.motion_ms += std::chrono::duration<double, std::milli>(t2 - t1).count();
+            sum.gpu_range_ms += std::chrono::duration<double, std::milli>(t2b - t2).count();
             sum.range_sensor_ms += std::chrono::duration<double, std::milli>(t3 - t2).count();
             sum.normalize_ms += std::chrono::duration<double, std::milli>(t4 - t3).count();
             sum.total_ms += std::chrono::duration<double, std::milli>(t4 - t0).count();
@@ -140,6 +164,7 @@ static PhaseTimes bench_point(RayMarchingGPU &range_method, RayMarching &obs_sou
     PhaseTimes avg;
     avg.resample_ms = sum.resample_ms / TIMED_ITERS;
     avg.motion_ms = sum.motion_ms / TIMED_ITERS;
+    avg.gpu_range_ms = sum.gpu_range_ms / TIMED_ITERS;
     avg.range_sensor_ms = sum.range_sensor_ms / TIMED_ITERS;
     avg.normalize_ms = sum.normalize_ms / TIMED_ITERS;
     avg.total_ms = sum.total_ms / TIMED_ITERS;
@@ -151,8 +176,8 @@ static void run_sweep(const char *method_name, RayMarchingGPU &range_method, Ray
     for (int n : particle_counts) {
         PhaseTimes t = bench_point(range_method, obs_source, map, n, angles, rng);
         double iters_per_sec = 1000.0 / t.total_ms;
-        std::printf("%s,%d,%d,%.3f,%.4f,%.4f,%.4f,%.4f,%.4f\n", method_name, n, (int)angles.size(), iters_per_sec,
-                    t.total_ms, t.resample_ms, t.motion_ms, t.range_sensor_ms, t.normalize_ms);
+        std::printf("%s,%d,%d,%.3f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n", method_name, n, (int)angles.size(), iters_per_sec,
+                    t.total_ms, t.resample_ms, t.motion_ms, t.range_sensor_ms, t.normalize_ms, t.gpu_range_ms);
     }
 }
 
@@ -189,7 +214,7 @@ int main() {
     const std::vector<int> sweep_60 = {500, 1000, 2000, 4000, 8000, 11700, 16000, 24000, 32000, 50000, 75000, 100000};
     const std::vector<int> sweep_1080 = {100, 300, 650, 1000, 2000};
 
-    std::printf("method,max_particles,num_rays,iters_per_sec,ms_total,ms_resample,ms_motion,ms_range_sensor,ms_normalize\n");
+    std::printf("method,max_particles,num_rays,iters_per_sec,ms_total,ms_resample,ms_motion,ms_range_sensor,ms_normalize,ms_gpu_range\n");
 
     run_sweep("rmgpu", rmgpu, rm, map, sweep_60, angles_60, rng);
     run_sweep("rmgpu", rmgpu, rm, map, sweep_1080, angles_1080, rng);
