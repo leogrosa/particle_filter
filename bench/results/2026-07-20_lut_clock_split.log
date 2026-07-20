@@ -1,0 +1,15 @@
+Source: build_lutclocks/bin/mcl_bench_lut (LUT_CLOCKS=ON), run on the Jetson, 2026-07-20.
+
+=== LUT_CLOCK_SPLIT: discretize_theta (arithmetic) vs giant_lut access (memory) ===
+NOTE: absolute ns/call figures below are inflated by per-call std::chrono::steady_clock
+overhead (tens of ns), which is on the same order as a single glt.calc_range query
+(~49ns measured previously on this map/config). That overhead lands ~equally on both
+accumulated sums, so treat only the RATIO between t_arith and t_total as trustworthy --
+the raw ns/call numbers below are NOT ground truth.
+calls_per_iter=200000, timed_iters=10 (sum-then-average; 3 warmup iters discarded)
+t_arith (discretize_theta_replica only) :     1.5058 ms total  (7.53 ns/call)
+t_total (glt.calc_range, real, public)  :    23.7717 ms total  (118.86 ns/call)
+t_mem_est = t_total - t_arith            :    22.2658 ms total  (111.33 ns/call)
+ratio t_arith / t_total   (arithmetic share) = 0.0633
+ratio t_mem_est / t_total (memory share)     = 0.9367
+======================================================================================
