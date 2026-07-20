@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <vector>
 
@@ -171,7 +172,13 @@ static std::vector<float> make_angles(int n) {
 	return a;
 }
 
-int main() {
+int main(int argc, char **argv) {
+	// Seed is a CLI arg (default 42) rather than hardcoded -- see mcl_bench_rmgpu.cpp's main()
+	// and rmgpu_stats.py for why: RM's per-ray marching step count is data-dependent, so a single
+	// seed's sweep can show non-monotonic timing purely from which map regions got sampled.
+	unsigned int seed = 42;
+	if (argc > 1) seed = (unsigned int)std::atoi(argv[1]);
+
 	OMap map(QUOTE(MAP_PATH));
 	if (map.error()) {
 		std::fprintf(stderr, "failed to load map: %s\n", QUOTE(MAP_PATH));
@@ -196,7 +203,7 @@ int main() {
 	pcddt.set_sensor_model(sensor_table.data(), table_width);
 	glt.set_sensor_model(sensor_table.data(), table_width);
 
-	std::mt19937 rng(42);
+	std::mt19937 rng(seed);
 
 	std::vector<float> angles_60 = make_angles(60);
 	std::vector<float> angles_1080 = make_angles(1080);

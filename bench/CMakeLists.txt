@@ -3,7 +3,8 @@ project(mcl_bench)
 
 # Standalone, non-catkin build: no ROS dependency, no Cython/Python wrapper.
 # Exercises RangeLib.h's real MCL hot path directly (see mcl_bench.cpp).
-option(WITH_CUDA "Compile the RMGPU rerun target (mcl_bench_rmgpu)" OFF)
+option(WITH_CUDA "Compile the GPU rerun targets (mcl_bench_rmgpu, mcl_bench_lutgpu)" OFF)
+option(LUT_CLOCKS "Build mcl_bench_lut with discretize_theta-vs-memory-access clock-split instrumentation" OFF)
 
 set(RANGE_LIBC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/range_libc)
 
@@ -32,6 +33,13 @@ add_executable(mcl_bench_lut mcl_bench_lut.cpp
     ${RANGE_LIBC_DIR}/vendor/lodepng/lodepng.cpp)
 target_link_libraries(mcl_bench_lut pthread)
 
+# opt-in only: splits calc_range's time into discretize_theta (arithmetic) vs giant_lut access
+# (memory) via a standalone replica function inside mcl_bench_lut.cpp -- RangeLib.h itself is
+# never touched. Same pattern as k_hops' COUNT_RM_HOPS below: flag off is a strict no-op.
+if(LUT_CLOCKS)
+	target_compile_definitions(mcl_bench_lut PRIVATE LUT_CLOCK_SPLIT=1)
+endif()
+
 # separate diagnostic tool: measures k (RayMarching dependent-hop count per ray), not timing.
 # its own target so the COUNT_RM_HOPS instrumentation never touches mcl_bench's hot path.
 add_executable(k_hops k_hops.cpp
@@ -51,4 +59,13 @@ if(WITH_CUDA)
 		${RANGE_LIBC_DIR}/vendor/lodepng/lodepng.cpp)
 	target_compile_definitions(mcl_bench_rmgpu PRIVATE USE_CUDA=1 CHUNK_SIZE=262144 NUM_THREADS=256)
 	target_link_libraries(mcl_bench_rmgpu pthread)
+
+	# GPU LUT rerun (see mcl_bench_lutgpu.cpp): the missing experiment -- a GPU version of the giant
+	# LUT (GiantLUTCastGPU). Same structure/flags as mcl_bench_rmgpu above (same kernels.cu, same
+	# -arch=sm_53, same CHUNK_SIZE/NUM_THREADS), adds this method's numbers to the same sweep.
+	cuda_add_executable(mcl_bench_lutgpu mcl_bench_lutgpu.cpp
+		${RANGE_LIBC_DIR}/includes/kernels.cu
+		${RANGE_LIBC_DIR}/vendor/lodepng/lodepng.cpp)
+	target_compile_definitions(mcl_bench_lutgpu PRIVATE USE_CUDA=1 CHUNK_SIZE=262144 NUM_THREADS=256)
+	target_link_libraries(mcl_bench_lutgpu pthread)
 endif()
