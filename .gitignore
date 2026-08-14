@@ -2,3 +2,4 @@
 ._*
 bench/build*/
 bench/k_hops_samples.csv
+bench/results/*

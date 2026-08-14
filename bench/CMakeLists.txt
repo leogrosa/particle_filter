@@ -33,6 +33,14 @@ add_executable(mcl_bench_lut mcl_bench_lut.cpp
     ${RANGE_LIBC_DIR}/vendor/lodepng/lodepng.cpp)
 target_link_libraries(mcl_bench_lut pthread)
 
+# Per-iteration convergence probe: does particle-filter convergence shrink the memory working set
+# touched by GiantLUTCast's position-indexed giant_lut lookups? Logs every iteration individually
+# (see mcl_convergence.cpp), unlike mcl_bench_lut's averaged WARMUP+TIMED sweep. Local-only /
+# exploratory tool, not gated by WITH_CUDA.
+add_executable(mcl_convergence mcl_convergence.cpp
+    ${RANGE_LIBC_DIR}/vendor/lodepng/lodepng.cpp)
+target_link_libraries(mcl_convergence pthread)
+
 # opt-in only: splits calc_range's time into discretize_theta (arithmetic) vs giant_lut access
 # (memory) via a standalone replica function inside mcl_bench_lut.cpp -- RangeLib.h itself is
 # never touched. Same pattern as k_hops' COUNT_RM_HOPS below: flag off is a strict no-op.
