@@ -310,6 +310,41 @@ static void resample_step(const std::vector<float> &particles,
   }
 }
 
+// Step: roughening (Gordon, Salmond & Smith 1993). Resampling collapses the
+// population onto a discrete subset of the pre-resample particles (sample
+// impoverishment) -- roughening adds a small amount of independent Gaussian
+// jitter back in per state dimension, sized relative to how spread-out the
+// just-resampled population currently is, rather than a fixed magnitude.
+// sigma_i = K * E_i * N^(-1/d), where E_i is dimension i's max-min spread
+// across the resampled particles, N is particle count, d is state
+// dimensionality (3: x, y, theta), and K (<<1) is the caller-supplied tuning
+// constant -- K=0 recovers no-op (plain resampling, unchanged behavior).
+static void roughen_step(std::vector<float> &particles, int n, float K,
+                         std::mt19937 &rng) {
+  const int d = 3;
+  float min_val[3], max_val[3];
+  for (int k = 0; k < d; ++k) {
+    min_val[k] = particles[k];
+    max_val[k] = particles[k];
+  }
+  for (int i = 1; i < n; ++i) {
+    for (int k = 0; k < d; ++k) {
+      float v = particles[i * d + k];
+      if (v < min_val[k]) min_val[k] = v;
+      if (v > max_val[k]) max_val[k] = v;
+    }
+  }
+  const float n_pow = std::pow((float)n, -1.0f / (float)d);
+  std::normal_distribution<float> noise[3];
+  for (int k = 0; k < d; ++k) {
+    float E_k = max_val[k] - min_val[k];
+    noise[k] = std::normal_distribution<float>(0.0f, K * E_k * n_pow);
+  }
+  for (int i = 0; i < n; ++i)
+    for (int k = 0; k < d; ++k)
+      particles[i * d + k] += noise[k](rng);
+}
+
 static void log_trajectory_row(FILE *f, int iter, const Pose &gt) {
   std::fprintf(f, "%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n", iter, gt.t, gt.x, gt.y,
                gt.theta, gt.vx, gt.vy);
@@ -352,6 +387,12 @@ static void print_usage(const char *prog) {
       "(iter,t,x,y,theta,vx,vy) from\n"
       "                this CSV instead of generating a stand-still "
       "trajectory\n"
+      "  --roughening-k  optional: roughening tuning constant K (Gordon et "
+      "al. 1993),\n"
+      "                default 0.2. sigma_i = K * E_i * N^(-1/d) added to "
+      "each particle\n"
+      "                dimension right after resampling. K=0 disables "
+      "roughening.\n"
       "\n"
       "Runs GiantLUTCast's real MCL hot path (see mcl_bench_lut.cpp) for "
       "--iters iterations,\n"
@@ -371,6 +412,7 @@ int main(int argc, char **argv) {
   bool have_seed = false;
   std::string out_prefix;
   std::string trajectory_path;
+  float roughening_k = 0.2f;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -397,6 +439,8 @@ int main(int argc, char **argv) {
       out_prefix = value;
     else if (arg == "--trajectory")
       trajectory_path = value;
+    else if (arg == "--roughening-k")
+      roughening_k = std::atof(value);
     else {
       std::fprintf(stderr, "unknown argument: %s\n", arg.c_str());
       print_usage(argv[0]);
@@ -594,6 +638,10 @@ int main(int argc, char **argv) {
       std::printf(
           "[iter %d/%d] resample: drew %d particles for the next iteration\n",
           iter, iters - 1, max_particles);
+
+      roughen_step(particles, max_particles, roughening_k, rng);
+      std::printf("[iter %d/%d] roughened resampled particles (K=%.3f)\n",
+                  iter, iters - 1, roughening_k);
     } else {
       std::printf("[iter %d/%d] last iteration -- skipping resample\n", iter,
                   iters - 1);
