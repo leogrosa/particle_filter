@@ -21,7 +21,7 @@ set(CMAKE_BUILD_TYPE Release)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 include_directories(${RANGE_LIBC_DIR})
-add_definitions(-DMAP_PATH=${CMAKE_CURRENT_SOURCE_DIR}/../maps/basement_fixed.png)
+add_definitions(-DMAP_PATH=${CMAKE_CURRENT_SOURCE_DIR}/../maps/basement_fixed_unmapped120.png)
 
 add_executable(mcl_bench mcl_bench.cpp
 	${RANGE_LIBC_DIR}/vendor/lodepng/lodepng.cpp)
@@ -40,6 +40,14 @@ target_link_libraries(mcl_bench_lut pthread)
 add_executable(mcl_convergence mcl_convergence.cpp
     ${RANGE_LIBC_DIR}/vendor/lodepng/lodepng.cpp)
 target_link_libraries(mcl_convergence pthread)
+
+# opt-in only: -g -O0 for mcl_convergence specifically, invoked from a separate build dir
+# (build_convergence_debug.sh) so the normal Release build above is untouched. Clang/GCC honor the
+# last -O flag on the command line, so appending -O0 after CMAKE_CXX_FLAGS' global -O3 wins.
+option(DEBUG_CONVERGENCE "Build mcl_convergence with -g -O0 instead of the global -O3, for lldb" OFF)
+if(DEBUG_CONVERGENCE)
+    target_compile_options(mcl_convergence PRIVATE -g -O0)
+endif()
 
 # opt-in only: splits calc_range's time into discretize_theta (arithmetic) vs giant_lut access
 # (memory) via a standalone replica function inside mcl_bench_lut.cpp -- RangeLib.h itself is

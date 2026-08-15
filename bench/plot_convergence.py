@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-Renders two static figures from the CSVs produced by `mcl_convergence --out-prefix PATH`:
+Renders two static figures from the CSVs produced by `mcl_convergence --out-prefix DIR`:
 
-  <base>_convergence.png -- 3 stacked subplots (distinct_cells, mean_dist_to_true w/
+  <base>/convergence.png -- 3 stacked subplots (distinct_cells, mean_dist_to_true w/
                              stddev_x/stddev_y, ms_range_sensor) vs iteration number,
-                             read from PATH_timing.csv only.
-  <base>_snapshots.png   -- small-multiples scatter of the particle cloud at a handful
+                             read from DIR/timing.csv only.
+  <base>/snapshots.png   -- small-multiples scatter of the particle cloud at a handful
                              of iterations (first / ~25% / ~50% / ~75% / last, adapted
                              to however many iterations are actually present), colored
                              by weight, with the ground-truth pose marked. Read from
-                             PATH_particles.csv + PATH_trajectory.csv.
+                             DIR/particles.csv + DIR/trajectory.csv.
 
 `<base>` is --output if given, else --out-prefix -- so by default this produces exactly
-<out-prefix>_convergence.png and <out-prefix>_snapshots.png.
+<out-prefix>/convergence.png and <out-prefix>/snapshots.png, alongside the CSVs.
 
 Coordinate note: particle/trajectory (x, y) are already in map-pixel coordinates, the
 same convention the C++ benchmarks use (range_libc's OMap loads grid[x][y] straight off
@@ -157,24 +157,24 @@ def plot_snapshots_panel(particles_csv, trajectory_csv, output, tag, n_snapshots
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out-prefix", required=True,
-                     help="shared prefix used with mcl_convergence --out-prefix "
-                          "(reads PATH_timing.csv, PATH_particles.csv, PATH_trajectory.csv)")
+                     help="output directory used with mcl_convergence --out-prefix "
+                          "(reads DIR/timing.csv, DIR/particles.csv, DIR/trajectory.csv)")
     ap.add_argument("--output", default=None,
-                     help="base output path; produces <output>_convergence.png and "
-                          "<output>_snapshots.png (default: derived from --out-prefix)")
+                     help="base output path; produces <output>/convergence.png and "
+                          "<output>/snapshots.png (default: same as --out-prefix)")
     args = ap.parse_args()
 
-    timing_csv = require_csv(f"{args.out_prefix}_timing.csv")
-    particles_csv = require_csv(f"{args.out_prefix}_particles.csv")
-    trajectory_csv = require_csv(f"{args.out_prefix}_trajectory.csv")
+    timing_csv = require_csv(f"{args.out_prefix}/timing.csv")
+    particles_csv = require_csv(f"{args.out_prefix}/particles.csv")
+    trajectory_csv = require_csv(f"{args.out_prefix}/trajectory.csv")
 
     base = args.output or args.out_prefix
-    tag = os.path.basename(args.out_prefix)
+    tag = os.path.basename(os.path.normpath(args.out_prefix))
 
-    convergence_out = plot_convergence_panel(timing_csv, f"{base}_convergence.png", tag)
+    convergence_out = plot_convergence_panel(timing_csv, f"{base}/convergence.png", tag)
     print(f"wrote {convergence_out}")
 
-    snapshots_out = plot_snapshots_panel(particles_csv, trajectory_csv, f"{base}_snapshots.png", tag)
+    snapshots_out = plot_snapshots_panel(particles_csv, trajectory_csv, f"{base}/snapshots.png", tag)
     print(f"wrote {snapshots_out}")
 
 

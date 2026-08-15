@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Animates the particle cloud evolving over PF iterations, reading the CSVs produced by
-`mcl_convergence --out-prefix PATH`. Companion to plot_convergence.py, which only shows
+`mcl_convergence --out-prefix DIR`. Companion to plot_convergence.py, which only shows
 a handful of static snapshots -- this is the full walk-through across every logged
 iteration: particle (x, y) scatter colored by weight, ground-truth pose marked each
 frame, current iteration number in the title.
@@ -59,23 +59,23 @@ def pick_writer(requested_output):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out-prefix", required=True,
-                     help="shared prefix used with mcl_convergence --out-prefix "
-                          "(reads PATH_particles.csv, PATH_trajectory.csv)")
+                     help="output directory used with mcl_convergence --out-prefix "
+                          "(reads DIR/particles.csv, DIR/trajectory.csv)")
     ap.add_argument("--output", default=None,
-                     help="output video/gif path (default: <out-prefix>_animation.mp4, "
+                     help="output video/gif path (default: <out-prefix>/animation.mp4, "
                           "falls back to .gif if the ffmpeg writer is unavailable)")
     ap.add_argument("--fps", type=int, default=5,
                      help="playback frames per second (default 5 -- this is for watching "
                           "convergence happen, not real-time video)")
     args = ap.parse_args()
 
-    particles_csv = require_csv(f"{args.out_prefix}_particles.csv")
-    trajectory_csv = require_csv(f"{args.out_prefix}_trajectory.csv")
+    particles_csv = require_csv(f"{args.out_prefix}/particles.csv")
+    trajectory_csv = require_csv(f"{args.out_prefix}/trajectory.csv")
 
     particles = pd.read_csv(particles_csv)
     traj = pd.read_csv(trajectory_csv).set_index("iter")
 
-    requested_output = args.output or f"{args.out_prefix}_animation.mp4"
+    requested_output = args.output or f"{args.out_prefix}/animation.mp4"
     writer_name, output_path = pick_writer(requested_output)
 
     img, w, h = load_map()
