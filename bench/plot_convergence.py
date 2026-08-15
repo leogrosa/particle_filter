@@ -30,6 +30,7 @@ import sys
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import pandas as pd
 
 MAP_PNG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "maps", "basement_fixed.png")
@@ -147,9 +148,16 @@ def plot_snapshots_panel(particles_csv, trajectory_csv, output, tag, n_snapshots
         )
         if it in traj.index:
             t = traj.loc[it]
-            ax.scatter(
-                [t["x"]], [t["y"]], marker="*", s=200, c="red",
-                edgecolors="black", linewidths=0.8, label="true pose", zorder=5,
+            # Narrow arrow pointing at the true pose instead of a big star marker,
+            # which was hiding whatever particles sat underneath it. Tail offset
+            # points away from the nearest map edge so the arrow stays on-canvas.
+            offset = 0.07 * max(w, h)
+            dx = offset if t["x"] < w / 2 else -offset
+            dy = offset if t["y"] < h / 2 else -offset
+            ax.annotate(
+                "", xy=(t["x"], t["y"]), xytext=(t["x"] + dx, t["y"] + dy),
+                arrowprops=dict(arrowstyle="->", color="red", lw=1.5, mutation_scale=14),
+                zorder=5,
             )
         ax.set_title(f"iter {it}")
         ax.set_xlim(0, w)
@@ -157,9 +165,8 @@ def plot_snapshots_panel(particles_csv, trajectory_csv, output, tag, n_snapshots
         ax.set_xticks([])
         ax.set_yticks([])
 
-    handles, labels = axes[-1].get_legend_handles_labels()
-    if handles:
-        fig.legend(handles, labels, loc="lower center", ncol=1, fontsize=9, bbox_to_anchor=(0.5, -0.02))
+    true_pose_handle = Line2D([0], [0], color="red", lw=1.5, marker=">", markersize=6, label="true pose")
+    fig.legend(handles=[true_pose_handle], loc="lower center", ncol=1, fontsize=9, bbox_to_anchor=(0.5, -0.02))
     if sc is not None:
         cbar = fig.colorbar(sc, ax=axes.tolist(), shrink=0.75, pad=0.015)
         cbar.set_label("particle weight")
