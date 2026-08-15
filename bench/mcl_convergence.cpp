@@ -84,6 +84,14 @@ static void set_identity_ros_transform(OMap &map) {
 // so check raw_grid directly against a strict near-white cutoff instead.
 // (Confirmed 2026-08-14 this isn't the cause of a separate, still-unexplained
 // slowdown -- reverting to map.get() didn't fix that -- so reinstating.)
+//
+// TODO: this raw_grid + FREE_SPACE_GRAY_MIN check duplicates classification
+// OMap already does at load time (grid[x][y] = gray < threshold). Now that
+// maps/basement_fixed_unmapped120.png recolors the unmapped-gray region dark
+// enough to fall on the occupied side of OMap's own default threshold=128,
+// map.get(x,y)/isOccupied(x,y) alone should be sufficient -- drop raw_grid and
+// FREE_SPACE_GRAY_MIN here and consume OMap's grid directly instead of
+// re-deriving a second, independently-chosen threshold in this file.
 static const float FREE_SPACE_GRAY_MIN = 189.0f;
 
 // Scans the map once for every valid free-space cell. Building this list up
