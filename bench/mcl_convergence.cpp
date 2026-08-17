@@ -206,13 +206,27 @@ static bool load_trajectory_csv(const std::string &path, int iters,
 // start of the run. Under this ordering, only the last iteration has no next
 // iteration to feed, so main() skips its resample instead.
 
-// Step: predict. Applies independent Gaussian process noise to each particle's
-// pose in place.
+// Step: predict. Each particle draws its own noisy "odometry" speed reading
+// (nominal_velocity +/- noise_v -- stands in for a real wheel-odometry/IMU
+// speed estimate, since we don't have one) and propagates x,y forward along
+// its OWN current heading by that speed * dt, converted from meters to pixels
+// via MAP_RESOLUTION. Heading is read before noise_theta perturbs it, so the
+// propagation direction matches the pose the particle actually represents
+// this iteration. The old isotropic noise_x/noise_y/noise_theta jitter is
+// still applied on top -- it now represents residual unmodeled motion (lateral
+// slip, heading-independent drift) rather than being the only motion signal.
 static void motion_step(std::vector<float> &particles, int n, std::mt19937 &rng,
+                        float dt, float nominal_velocity,
+                        std::normal_distribution<float> &noise_v,
                         std::normal_distribution<float> &noise_x,
                         std::normal_distribution<float> &noise_y,
                         std::normal_distribution<float> &noise_theta) {
   for (int i = 0; i < n; ++i) {
+    float v = nominal_velocity + noise_v(rng);
+    float heading = particles[i * 3 + 2];
+    float dist_px = (v * dt) / MAP_RESOLUTION;
+    particles[i * 3 + 0] += dist_px * std::cos(heading);
+    particles[i * 3 + 1] += dist_px * std::sin(heading);
     particles[i * 3 + 0] += noise_x(rng);
     particles[i * 3 + 1] += noise_y(rng);
     particles[i * 3 + 2] += noise_theta(rng);
@@ -281,6 +295,29 @@ measurement_update(GiantLUTCast &glt, std::vector<float> &particles,
   return std::chrono::duration<double, std::milli>(t1 - t0).count();
 }
 
+// Step: squash. The measurement update's raw weight is a product of
+// num_rays sub-1 terms, so raw weights can differ by hundreds of orders of
+// magnitude across particles (e.g. 1e-145 vs 1e-166 with only 2 particles) --
+// far more separation than normalization can meaningfully redistribute. This
+// is precisely the "Precise Observation Models may make the PF fail" failure
+// mode (docs/Lab5.pdf sec 3.2): a peaked per-ray likelihood makes a scattered
+// population unlikely to land near the true peak at all, so weight collapses
+// onto whichever particle got lucky, not necessarily the correct one --
+// matches the ESS=1/degeneracy + wrong-pose lock-in found 2026-08-16. Fix,
+// same as MIT's own particle_filter.py sensor_model() (e.g. lines
+// 497/503/518/538/561) and its cited source (Bagnell, "Particle Filters: The
+// Good, The Bad, The Ugly", papers/16831_lecture05_gseyfarth_zbatts.pdf,
+// sec 3.2, fix 3: "take all of the probabilities to some power 1/p less than
+// 1. When this is done, p observations count as 1 observation"): raise each
+// raw weight to 1/squash_factor before normalizing. squash_factor=1 is a
+// no-op; MIT's own default is 2.2 (launch/localize.launch).
+static void squash_weights(std::vector<double> &weights, int n,
+                           double squash_factor) {
+  double inv_squash = 1.0 / squash_factor;
+  for (int i = 0; i < n; ++i)
+    weights[i] = std::pow(weights[i], inv_squash);
+}
+
 // Step: normalize this iteration's raw weights into a proper distribution for
 // resampling/logging.
 static void normalize_weights(const std::vector<double> &new_weights,
@@ -290,6 +327,22 @@ static void normalize_weights(const std::vector<double> &new_weights,
     wsum += new_weights[i];
   for (int i = 0; i < n; ++i)
     weights[i] = new_weights[i] / wsum;
+}
+
+// Step: effective sample size on this iteration's just-normalized weights,
+// BEFORE resampling runs -- ESS = 1 / sum(w_i^2). ESS == n means every
+// particle is carrying equal posterior mass (uninformative likelihood or a
+// flat posterior); ESS -> 1 means the population is already degenerate onto
+// essentially one particle before resampling even has a chance to run.
+// Distinguishes "the likelihood itself collapsed the weights" from "resampling
+// variance is what's discarding particles" -- resample_step below can only
+// make a population look worse than what its ESS already implies, never
+// better.
+static double compute_ess(const std::vector<double> &weights, int n) {
+  double sq_sum = 0.0;
+  for (int i = 0; i < n; ++i)
+    sq_sum += weights[i] * weights[i];
+  return 1.0 / sq_sum;
 }
 
 // Step: resample, weighted by this iteration's just-normalized weights --
@@ -365,9 +418,10 @@ static void log_particles(FILE *f, int iter,
 
 static void log_timing_row(FILE *f, int iter, long distinct_cells,
                            double mean_dist_to_true, double stddev_x,
-                           double stddev_y, double ms_range_sensor) {
-  std::fprintf(f, "%d,%ld,%.6f,%.6f,%.6f,%.6f\n", iter, distinct_cells,
-               mean_dist_to_true, stddev_x, stddev_y, ms_range_sensor);
+                           double stddev_y, double ms_range_sensor,
+                           double ess) {
+  std::fprintf(f, "%d,%ld,%.6f,%.6f,%.6f,%.6f,%.6f\n", iter, distinct_cells,
+               mean_dist_to_true, stddev_x, stddev_y, ms_range_sensor, ess);
 }
 
 static void print_usage(const char *prog) {
@@ -393,6 +447,30 @@ static void print_usage(const char *prog) {
       "each particle\n"
       "                dimension right after resampling. K=0 disables "
       "roughening.\n"
+      "  --squash-factor  optional: squash the raw measurement-update weight "
+      "by raising it\n"
+      "                to 1/squash_factor before normalizing (see "
+      "docs/Lab5.pdf sec 3.2 /\n"
+      "                papers/16831_lecture05_gseyfarth_zbatts.pdf sec 3.2), "
+      "default 2.2\n"
+      "                (matches MIT particle_filter.py's default). "
+      "squash_factor=1 disables\n"
+      "                squashing (raw product, unchanged behavior).\n"
+      "  --dt          optional: seconds per iteration, default 1/40s (40Hz). "
+      "Used to convert\n"
+      "                the per-particle odometry speed into a per-iteration "
+      "displacement. Keep\n"
+      "                matched to generate_trajectory.py's --dt when using "
+      "--trajectory.\n"
+      "  --nominal-velocity   optional: assumed forward speed in m/s, default "
+      "1.8 (matches\n"
+      "                generate_trajectory.py's default). Each particle's own "
+      "noisy odometry\n"
+      "                speed reading is drawn as nominal_velocity + "
+      "N(0, velocity-noise-std).\n"
+      "  --velocity-noise-std  optional: std dev in m/s of the per-particle "
+      "odometry speed\n"
+      "                noise, default 0.05.\n"
       "\n"
       "Runs GiantLUTCast's real MCL hot path (see mcl_bench_lut.cpp) for "
       "--iters iterations,\n"
@@ -413,6 +491,10 @@ int main(int argc, char **argv) {
   std::string out_prefix;
   std::string trajectory_path;
   float roughening_k = 0.2f;
+  double squash_factor = 2.2;
+  float dt_seconds = 1.0f / 40.0f;
+  float nominal_velocity = 1.8f;
+  float velocity_noise_std = 0.05f;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -441,6 +523,14 @@ int main(int argc, char **argv) {
       trajectory_path = value;
     else if (arg == "--roughening-k")
       roughening_k = std::atof(value);
+    else if (arg == "--squash-factor")
+      squash_factor = std::atof(value);
+    else if (arg == "--dt")
+      dt_seconds = std::atof(value);
+    else if (arg == "--nominal-velocity")
+      nominal_velocity = std::atof(value);
+    else if (arg == "--velocity-noise-std")
+      velocity_noise_std = std::atof(value);
     else {
       std::fprintf(stderr, "unknown argument: %s\n", arg.c_str());
       print_usage(argv[0]);
@@ -559,6 +649,7 @@ int main(int argc, char **argv) {
   std::normal_distribution<float> noise_x(0.0f, MOTION_DISPERSION_X);
   std::normal_distribution<float> noise_y(0.0f, MOTION_DISPERSION_Y);
   std::normal_distribution<float> noise_theta(0.0f, MOTION_DISPERSION_THETA);
+  std::normal_distribution<float> noise_v(0.0f, velocity_noise_std);
 
   // out_prefix is a directory now (one per run, e.g.
   // bench/results/2026-08-14_153045/), holding plainly-named
@@ -580,7 +671,7 @@ int main(int argc, char **argv) {
   }
 
   std::fprintf(f_timing, "iter,distinct_cells,mean_dist_to_true,stddev_x,"
-                         "stddev_y,ms_range_sensor\n");
+                         "stddev_y,ms_range_sensor,ess\n");
   std::fprintf(f_particles, "iter,particle_id,x,y,theta,weight\n");
   std::fprintf(f_trajectory, "iter,t,x,y,theta,vx,vy\n");
 
@@ -595,7 +686,8 @@ int main(int argc, char **argv) {
     std::printf("[iter %d/%d] motion: applying process noise to %d particles\n",
                 iter, iters - 1, max_particles);
     std::fflush(stdout);
-    motion_step(particles, max_particles, rng, noise_x, noise_y, noise_theta);
+    motion_step(particles, max_particles, rng, dt_seconds, nominal_velocity,
+               noise_v, noise_x, noise_y, noise_theta);
 
     long distinct_cells;
     double mean_dist_to_true, stddev_x, stddev_y;
@@ -618,13 +710,25 @@ int main(int argc, char **argv) {
                 ms_range_sensor);
     std::fflush(stdout);
 
+    squash_weights(new_weights, max_particles, squash_factor);
+    std::printf("[iter %d/%d] squashed weights (squash_factor=%.3f)\n", iter,
+                iters - 1, squash_factor);
+    std::fflush(stdout);
+
     normalize_weights(new_weights, weights, max_particles);
     std::printf("[iter %d/%d] normalized weights\n", iter, iters - 1);
     std::fflush(stdout);
 
+    double ess = compute_ess(weights, max_particles);
+    std::printf("[iter %d/%d] effective sample size: ESS=%.1f (%.1f%% of %d "
+                "particles)\n",
+                iter, iters - 1, ess, 100.0 * ess / max_particles,
+                max_particles);
+    std::fflush(stdout);
+
     log_particles(f_particles, iter, particles, weights, max_particles);
     log_timing_row(f_timing, iter, distinct_cells, mean_dist_to_true, stddev_x,
-                   stddev_y, ms_range_sensor);
+                   stddev_y, ms_range_sensor, ess);
     std::printf("[iter %d/%d] logged particles + timing rows\n", iter,
                 iters - 1);
     std::fflush(stdout);

@@ -24,6 +24,7 @@ Usage:
   ./plot_convergence.py --out-prefix results/convergence_run1
 """
 import argparse
+import math
 import os
 import sys
 
@@ -148,15 +149,18 @@ def plot_snapshots_panel(particles_csv, trajectory_csv, output, tag, n_snapshots
         )
         if it in traj.index:
             t = traj.loc[it]
-            # Narrow arrow pointing at the true pose instead of a big star marker,
-            # which was hiding whatever particles sat underneath it. Tail offset
-            # points away from the nearest map edge so the arrow stays on-canvas.
-            offset = 0.07 * max(w, h)
-            dx = offset if t["x"] < w / 2 else -offset
-            dy = offset if t["y"] < h / 2 else -offset
+            # Small arrow anchored exactly at the true pose, pointing along its actual
+            # heading (theta) -- replaces the earlier big star marker (which hid
+            # particles underneath it) and then a position-only offset arrow (which
+            # didn't convey heading, back when ground truth was stand-still and theta
+            # was arbitrary/random). Now that ground truth can be a moving trajectory,
+            # theta is meaningful, so show it directly instead of an arbitrary offset.
+            HEADING_ARROW_LEN = 20  # px, deliberately small/subtle
+            dx = HEADING_ARROW_LEN * math.cos(t["theta"])
+            dy = HEADING_ARROW_LEN * math.sin(t["theta"])
             ax.annotate(
-                "", xy=(t["x"], t["y"]), xytext=(t["x"] + dx, t["y"] + dy),
-                arrowprops=dict(arrowstyle="->", color="red", lw=1.5, mutation_scale=14),
+                "", xy=(t["x"] + dx, t["y"] + dy), xytext=(t["x"], t["y"]),
+                arrowprops=dict(arrowstyle="->", color="red", lw=1.5, mutation_scale=10),
                 zorder=5,
             )
         ax.set_title(f"iter {it}")

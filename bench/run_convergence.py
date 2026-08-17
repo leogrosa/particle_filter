@@ -25,6 +25,7 @@ roughly every iters//20 iterations after that -- both best-effort, since no flus
 the binary's own CSV writes, so rows may arrive in bursts rather than smoothly.
 """
 import argparse
+import math
 import subprocess
 import sys
 import threading
@@ -95,14 +96,14 @@ def _poll_timing_progress(timing_path, iters, stop_event):
             rows = f.read().splitlines()[1:]  # skip header
         n = len(rows)
         if n > last_reported and n >= next_threshold:
-            iter_val, _, _, _, _, ms_range_sensor = rows[n - 1].split(",")
-            logger.info(f"    iter {iter_val}/{iters} ({100 * n // iters}%) -- ms_range_sensor={float(ms_range_sensor):.3f}")
+            iter_val, _, _, _, _, ms_range_sensor, ess = rows[n - 1].split(",")
+            logger.info(f"    iter {iter_val}/{iters} ({100 * n // iters}%) -- ms_range_sensor={float(ms_range_sensor):.3f} ess={float(ess):.1f}")
             last_reported = n
             while next_threshold <= n:
                 next_threshold += progress_interval
 
 
-def run_binary(particles, rays, iters, seed, out_prefix, trajectory):
+def run_binary(particles, rays, iters, seed, out_prefix, trajectory, dt, squash_factor):
     cmd = [
         str(BINARY),
         "--particles", str(particles),
@@ -110,6 +111,8 @@ def run_binary(particles, rays, iters, seed, out_prefix, trajectory):
         "--iters", str(iters),
         "--seed", str(seed),
         "--out-prefix", str(out_prefix),
+        "--dt", str(dt),
+        "--squash-factor", str(squash_factor),
     ]
     if trajectory is not None:
         cmd += ["--trajectory", str(trajectory)]
@@ -148,7 +151,30 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--particles", type=int, default=2000, help="number of particles (default 2000)")
     ap.add_argument("--rays", type=int, default=60, help="number of LIDAR rays (default 60)")
-    ap.add_argument("--iters", type=int, default=60, help="number of MCL iterations (default 60)")
+    ap.add_argument("--iters", type=int, default=None,
+                     help="number of MCL iterations (default 60, unless --time is given). "
+                          "Mutually exclusive with --time.")
+    ap.add_argument("--time", type=float, default=None,
+                     help="simulation duration in seconds, as an alternative to --iters -- "
+                          "this script computes iters = ceil(time / dt). Mutually exclusive "
+                          "with --iters.")
+    ap.add_argument("--dt", type=float, default=1.0 / 40.0,
+                     help="seconds per iteration (default 1/40s = 40Hz). Used here to convert "
+                          "--time into an iteration count, AND forwarded to the binary's own "
+                          "--dt, which it uses to convert each particle's per-iteration odometry "
+                          "speed reading into a pixel displacement. If you're also passing "
+                          "--trajectory from generate_trajectory.py, keep this matched to "
+                          "that script's --dt, or 'N seconds of simulation' here won't "
+                          "actually correspond to N seconds of the ground-truth robot's "
+                          "motion (mcl_convergence.cpp indexes the trajectory CSV by row "
+                          "number, not by its t column).")
+    ap.add_argument("--squash-factor", type=float, default=2.2,
+                     help="squash the raw measurement-update weight by raising it to "
+                          "1/squash_factor before normalizing, forwarded to the binary's own "
+                          "--squash-factor (see mcl_convergence.cpp's squash_weights(), "
+                          "docs/Lab5.pdf sec 3.2). Default 2.2 matches MIT particle_filter.py's "
+                          "own default (launch/localize.launch); squash_factor=1 disables "
+                          "squashing.")
     ap.add_argument("--seed", type=int, default=42, help="RNG seed (default 42)")
     ap.add_argument("--out-prefix", default=None,
                      help="output directory; the binary writes <dir>/timing.csv, "
@@ -160,6 +186,16 @@ def main():
                           "trajectory when omitted); plumbed through for a future phase.")
     args = ap.parse_args()
 
+    if args.time is not None and args.iters is not None:
+        ap.error("--time and --iters are mutually exclusive -- pass one or the other")
+    if args.time is not None:
+        iters = math.ceil(args.time / args.dt)
+        logger.info(f"==> --time {args.time}s @ dt={args.dt}s -> {iters} iterations")
+    elif args.iters is not None:
+        iters = args.iters
+    else:
+        iters = 60
+
     if args.out_prefix is None:
         out_prefix = DEFAULT_RESULTS_DIR / datetime.now().strftime("%Y-%m-%d_%H%M%S")
     else:
@@ -167,14 +203,15 @@ def main():
     out_prefix.mkdir(parents=True, exist_ok=True)
 
     logger.info(
-        f"==> Config: particles={args.particles} rays={args.rays} iters={args.iters} "
-        f"seed={args.seed} out_prefix={out_prefix}"
+        f"==> Config: particles={args.particles} rays={args.rays} iters={iters} "
+        f"seed={args.seed} squash_factor={args.squash_factor} out_prefix={out_prefix}"
     )
     if args.trajectory is not None:
         logger.info(f"==> Forwarding --trajectory {args.trajectory}")
 
     build_binary()
-    run_binary(args.particles, args.rays, args.iters, args.seed, out_prefix, args.trajectory)
+    run_binary(args.particles, args.rays, iters, args.seed, out_prefix, args.trajectory, args.dt,
+               args.squash_factor)
 
     timing_csv = out_prefix / "timing.csv"
     particles_csv = out_prefix / "particles.csv"
