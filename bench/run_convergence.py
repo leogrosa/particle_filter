@@ -103,7 +103,8 @@ def _poll_timing_progress(timing_path, iters, stop_event):
                 next_threshold += progress_interval
 
 
-def run_binary(particles, rays, iters, seed, out_prefix, trajectory, dt, squash_factor):
+def run_binary(particles, rays, iters, seed, out_prefix, trajectory, dt, squash_factor,
+               roughening_k, ess_resampling_threshold):
     cmd = [
         str(BINARY),
         "--particles", str(particles),
@@ -113,6 +114,8 @@ def run_binary(particles, rays, iters, seed, out_prefix, trajectory, dt, squash_
         "--out-prefix", str(out_prefix),
         "--dt", str(dt),
         "--squash-factor", str(squash_factor),
+        "--roughening-k", str(roughening_k),
+        "--ess-resampling-threshold", str(ess_resampling_threshold),
     ]
     if trajectory is not None:
         cmd += ["--trajectory", str(trajectory)]
@@ -175,6 +178,17 @@ def main():
                           "docs/Lab5.pdf sec 3.2). Default 2.2 matches MIT particle_filter.py's "
                           "own default (launch/localize.launch); squash_factor=1 disables "
                           "squashing.")
+    ap.add_argument("--roughening-k", type=float, default=0.2,
+                     help="roughening tuning constant K (Gordon, Salmond & Smith 1993), "
+                          "forwarded to the binary's own --roughening-k. "
+                          "sigma_i = K * E_i * N^(-1/d) added to each particle dimension "
+                          "right after resampling. Default 0.2; K=0 disables roughening.")
+    ap.add_argument("--ess-resampling-threshold", type=float, default=0.2,
+                     help="skip resampling (and roughening) when ESS is above this fraction "
+                          "of N, forwarded to the binary's own --ess-resampling-threshold "
+                          "(see mcl_convergence.cpp's resample skip logic, "
+                          "papers/16831_lecture05_gseyfarth_zbatts.pdf). Default 0.2; 0 "
+                          "disables skipping (always resample).")
     ap.add_argument("--seed", type=int, default=42, help="RNG seed (default 42)")
     ap.add_argument("--out-prefix", default=None,
                      help="output directory; the binary writes <dir>/timing.csv, "
@@ -204,14 +218,15 @@ def main():
 
     logger.info(
         f"==> Config: particles={args.particles} rays={args.rays} iters={iters} "
-        f"seed={args.seed} squash_factor={args.squash_factor} out_prefix={out_prefix}"
+        f"seed={args.seed} squash_factor={args.squash_factor} roughening_k={args.roughening_k} "
+        f"ess_resampling_threshold={args.ess_resampling_threshold} out_prefix={out_prefix}"
     )
     if args.trajectory is not None:
         logger.info(f"==> Forwarding --trajectory {args.trajectory}")
 
     build_binary()
     run_binary(args.particles, args.rays, iters, args.seed, out_prefix, args.trajectory, args.dt,
-               args.squash_factor)
+               args.squash_factor, args.roughening_k, args.ess_resampling_threshold)
 
     timing_csv = out_prefix / "timing.csv"
     particles_csv = out_prefix / "particles.csv"

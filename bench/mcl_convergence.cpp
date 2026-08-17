@@ -37,7 +37,6 @@ static const double Z_SHORT = 0.01, Z_MAX = 0.07, Z_RAND = 0.12, Z_HIT = 0.75,
                     SIGMA_HIT = 8.0;
 static const float MOTION_DISPERSION_X = 0.05f, MOTION_DISPERSION_Y = 0.025f,
                    MOTION_DISPERSION_THETA = 0.25f;
-static const float ESS_RESAMPLING_THRESHOLD_N = 0.2f;
 
 // direct port of ParticleFiler.precompute_sensor_model() from
 // particle_filter.py, same as mcl_bench.cpp / mcl_bench_lut.cpp
@@ -351,14 +350,32 @@ static double compute_ess(const std::vector<double> &weights, int n) {
 // Caller (main()) decides WHETHER to call this at all (ESS-above-threshold
 // skip) -- this function always resamples unconditionally when called, so
 // its output (proposal/proposal_indices) is never stale/partially-written.
+// Low-variance / systematic resampling (Thrun, Burgard & Fox, "Probabilistic
+// Robotics" table 4.4 -- AKA "Stochastic Universal Sampler"; Bagnell's Fig.
+// 2, papers/16831_lecture05_gseyfarth_zbatts.pdf): a single random offset r,
+// then one O(N) sequential walk over the cumulative weights, instead of N
+// independent draws (the old std::discrete_distribution -- effectively
+// multinomial resampling, higher-variance and an O(log N) binary search per
+// draw). Guarantees any particle with normalized weight > 1/n is drawn at
+// least once -- directly targets resampling's own "Lack of Diversity"
+// problem, on top of squash_weights's separate dynamic-range fix above.
 static void resample_step(const std::vector<float> &particles,
                           const std::vector<double> &weights,
                           std::vector<float> &proposal,
                           std::vector<int> &proposal_indices, int n,
                           std::mt19937 &rng) {
-  std::discrete_distribution<int> resample_dist(weights.begin(), weights.end());
-  for (int i = 0; i < n; ++i)
-    proposal_indices[i] = resample_dist(rng);
+  std::uniform_real_distribution<double> r_dist(0.0, 1.0 / n);
+  double r = r_dist(rng);
+  double c = weights[0];
+  int idx = 0;
+  for (int i = 0; i < n; ++i) {
+    double u = r + (double)i / (double)n;
+    while (u > c && idx < n - 1) {
+      ++idx;
+      c += weights[idx];
+    }
+    proposal_indices[i] = idx;
+  }
   for (int i = 0; i < n; ++i) {
     int j = proposal_indices[i];
     proposal[i * 3 + 0] = particles[j * 3 + 0];
@@ -453,6 +470,13 @@ static void print_usage(const char *prog) {
       "each particle\n"
       "                dimension right after resampling. K=0 disables "
       "roughening.\n"
+      "  --ess-resampling-threshold  optional: skip resampling (and "
+      "roughening) when ESS is\n"
+      "                above this fraction of N -- weights aren't "
+      "informative enough yet to be\n"
+      "                worth redistributing mass over (Bagnell, "
+      "papers/16831_lecture05_gseyfarth_zbatts.pdf).\n"
+      "                Default 0.2. 0 disables skipping (always resample).\n"
       "  --squash-factor  optional: squash the raw measurement-update weight "
       "by raising it\n"
       "                to 1/squash_factor before normalizing (see "
@@ -497,6 +521,7 @@ int main(int argc, char **argv) {
   std::string out_prefix;
   std::string trajectory_path;
   float roughening_k = 0.2f;
+  float ess_resampling_threshold = 0.2f;
   double squash_factor = 2.2;
   float dt_seconds = 1.0f / 40.0f;
   float nominal_velocity = 1.8f;
@@ -529,6 +554,8 @@ int main(int argc, char **argv) {
       trajectory_path = value;
     else if (arg == "--roughening-k")
       roughening_k = std::atof(value);
+    else if (arg == "--ess-resampling-threshold")
+      ess_resampling_threshold = std::atof(value);
     else if (arg == "--squash-factor")
       squash_factor = std::atof(value);
     else if (arg == "--dt")
@@ -748,11 +775,11 @@ int main(int argc, char **argv) {
       // worth redistributing mass over. resample_step is only ever called
       // when we're actually going to use its output, so proposal/
       // proposal_indices are never stale when swapped in below.
-      if (ess > ESS_RESAMPLING_THRESHOLD_N * max_particles) {
+      if (ess > ess_resampling_threshold * max_particles) {
         std::printf("[iter %d/%d] ESS=%.1f above threshold (%.1f%% of %d) -- "
                     "skipping resample\n",
                     iter, iters - 1, ess,
-                    100.0 * ESS_RESAMPLING_THRESHOLD_N, max_particles);
+                    100.0 * ess_resampling_threshold, max_particles);
       } else {
         resample_step(particles, weights, proposal, proposal_indices,
                       max_particles, rng);
