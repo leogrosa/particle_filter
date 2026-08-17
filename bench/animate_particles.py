@@ -15,9 +15,11 @@ Output: prefers an mp4 via the ffmpeg writer; if ffmpeg isn't available on this 
 falls back to an animated GIF via the Pillow writer instead of crashing.
 
 Usage:
-  ./animate_particles.py --out-prefix results/convergence_run1 --fps 5
+  ./animate_particles.py --out-prefix results/convergence_run1
+  ./animate_particles.py --out-prefix results/convergence_run1 --fps 5  # slow motion
 """
 import argparse
+import math
 import os
 import sys
 
@@ -25,7 +27,12 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.animation as animation
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import pandas as pd
+from loguru import logger
+
+HEADING_ARROW_LEN = 20  # px, deliberately small/subtle -- see plot_convergence.py's
+                        # matching choice for the same true-pose heading arrow
 
 MAP_PNG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "maps", "basement_fixed.png")
 
@@ -64,10 +71,19 @@ def main():
     ap.add_argument("--output", default=None,
                      help="output video/gif path (default: <out-prefix>/animation.mp4, "
                           "falls back to .gif if the ffmpeg writer is unavailable)")
-    ap.add_argument("--fps", type=int, default=5,
-                     help="playback frames per second (default 5 -- this is for watching "
-                          "convergence happen, not real-time video)")
+    ap.add_argument("--fps", type=float, default=None,
+                     help="playback frames per second. Default: 1/--dt, i.e. real-time "
+                          "playback (one frame per iteration, each iteration is --dt "
+                          "simulated seconds). Pass explicitly to play slower/faster than "
+                          "real time, e.g. --fps 5 to watch convergence in slow motion.")
+    ap.add_argument("--dt", type=float, default=1.0 / 40.0,
+                     help="seconds per iteration, for displaying simulated elapsed time "
+                          "in the title instead of a raw iteration count (default 1/40s "
+                          "= 40Hz). Keep matched to whatever --dt generate_trajectory.py "
+                          "or run_convergence.py used, if you want the displayed time to "
+                          "mean anything physically.")
     args = ap.parse_args()
+    fps = args.fps if args.fps is not None else 1.0 / args.dt
 
     particles_csv = require_csv(f"{args.out_prefix}/particles.csv")
     trajectory_csv = require_csv(f"{args.out_prefix}/trajectory.csv")
@@ -94,11 +110,15 @@ def main():
         first["x"], first["y"], c=first["weight"], cmap="viridis",
         vmin=vmin, vmax=vmax, s=8, alpha=0.85, linewidths=0,
     )
-    true_marker, = ax.plot(
-        [], [], marker="*", markersize=16, color="red",
-        markeredgecolor="black", linestyle="none", label="true pose",
+    true_quiver = ax.quiver(
+        [0], [0], [0], [0], color="red", angles="xy", scale_units="xy", scale=1,
+        width=0.005, zorder=5,
     )
-    ax.legend(loc="upper right", fontsize=8, framealpha=0.9)
+    true_pose_handle = Line2D(
+        [0], [0], color="red", lw=1.5, marker=">", markersize=6,
+        linestyle="none", label="true pose",
+    )
+    ax.legend(handles=[true_pose_handle], loc="upper right", fontsize=8, framealpha=0.9)
     cbar = fig.colorbar(scat, ax=ax, shrink=0.8)
     cbar.set_label("particle weight")
     title = ax.set_title("")
@@ -111,14 +131,30 @@ def main():
         scat.set_array(sub["weight"].to_numpy())
         if it in traj.index:
             t = traj.loc[it]
-            true_marker.set_data([t["x"]], [t["y"]])
-        title.set_text(f"iteration {it} / {iters_sorted[-1]}  ({len(sub)} particles)")
-        return scat, true_marker, title
+            true_quiver.set_offsets([[t["x"], t["y"]]])
+            true_quiver.set_UVC(
+                HEADING_ARROW_LEN * math.cos(t["theta"]),
+                HEADING_ARROW_LEN * math.sin(t["theta"]),
+            )
+        sim_t = it * args.dt
+        title.set_text(
+            f"t={sim_t:.3f}s  (iteration {it} / {iters_sorted[-1]}, {len(sub)} particles)"
+        )
+        return scat, true_quiver, title
 
-    anim = animation.FuncAnimation(fig, update, frames=len(iters_sorted), blit=False)
-    anim.save(output_path, writer=writer_name, fps=args.fps)
+    total_frames = len(iters_sorted)
+    log_every = max(1, total_frames // 20)  # ~20 progress lines regardless of length
+
+    def report_progress(current_frame, _total_frames):
+        if current_frame % log_every == 0 or current_frame == total_frames - 1:
+            pct = 100.0 * (current_frame + 1) / total_frames
+            logger.info(f"rendering frame {current_frame + 1}/{total_frames} ({pct:.0f}%)")
+
+    anim = animation.FuncAnimation(fig, update, frames=total_frames, blit=False)
+    logger.info(f"rendering {total_frames} frames to {output_path} ({writer_name}, {fps:.1f}fps)")
+    anim.save(output_path, writer=writer_name, fps=fps, progress_callback=report_progress)
     plt.close(fig)
-    print(f"wrote {output_path}")
+    logger.info(f"wrote {output_path}")
 
 
 if __name__ == "__main__":

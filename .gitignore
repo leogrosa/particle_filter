@@ -6,3 +6,4 @@ bench/results/*
 *.csv
 */.DS_Store
 .DS_Store
+bench/test/
