@@ -1,4 +1,5 @@
 #include "range_libc/includes/RangeLib.h"
+#include "mcl_common.h"
 
 #include <chrono>
 #include <cmath>
@@ -30,50 +31,26 @@ using Clock = std::chrono::steady_clock;
 // (mcl_bench*.cpp); total per-iteration wall time here doesn't need to fit any
 // real-time budget, only the calc_range_repeat_angles_eval_sensor_model call
 // itself is timed.
-static const float MAP_RESOLUTION = 0.0504f;
-static const float MAX_RANGE_METERS = 10.0f;
-static const int THETA_DISCRETIZATION = 112;
-static const double Z_SHORT = 0.01, Z_MAX = 0.07, Z_RAND = 0.12, Z_HIT = 0.75,
-                    SIGMA_HIT = 8.0;
+// MAP_RESOLUTION, MAX_RANGE_METERS, THETA_DISCRETIZATION, Z_*/SIGMA_HIT,
+// build_sensor_model_table(), set_identity_ros_transform(), make_angles()
+// now live in mcl_common.h (2026-08-17), shared with likelihood_probe.cpp.
+//
+// Direct port of MIT's own ROS defaults (particle_filter.py:63-65,
+// motion_dispersion_x/y/theta). MIT's self.particles live in real-world
+// METERS (Utils.map_to_world at init), so these are meter-space stds --
+// theta is unitless/angle so it needs no conversion, but x/y do: our
+// particles are raw pixels (identity world_scale, see
+// set_identity_ros_transform), same as motion_step's primary dist_px term
+// already converts v*dt from meters via MAP_RESOLUTION. Applying
+// MOTION_DISPERSION_X/Y directly as pixel-std (as before 2026-08-17)
+// under-injected lateral noise by 1/MAP_RESOLUTION (~19.8x) -- fixed by
+// converting to pixel-std at the noise_x/noise_y distribution construction
+// site below, the same place/pattern dist_px uses.
+//
+// Now just default values -- overridable via --motion-dispersion-x/y/theta
+// (2026-08-17) so a zero-process-noise isolation run doesn't need a rebuild.
 static const float MOTION_DISPERSION_X = 0.05f, MOTION_DISPERSION_Y = 0.025f,
                    MOTION_DISPERSION_THETA = 0.25f;
-
-// direct port of ParticleFiler.precompute_sensor_model() from
-// particle_filter.py, same as mcl_bench.cpp / mcl_bench_lut.cpp
-static std::vector<double> build_sensor_model_table(int table_width) {
-  std::vector<double> table(table_width * table_width);
-  for (int d = 0; d < table_width; ++d) {
-    double norm = 0.0;
-    for (int r = 0; r < table_width; ++r) {
-      double prob = 0.0;
-      double z = (double)(r - d);
-      prob += Z_HIT * std::exp(-(z * z) / (2.0 * SIGMA_HIT * SIGMA_HIT)) /
-              (SIGMA_HIT * std::sqrt(2.0 * M_PI));
-      if (r < d)
-        prob += 2.0 * Z_SHORT * (d - r) / (double)d;
-      if (r == table_width - 1)
-        prob += Z_MAX;
-      if (r < table_width - 1)
-        prob += Z_RAND / (double)(table_width - 1);
-      norm += prob;
-      table[r * table_width + d] = prob;
-    }
-    for (int r = 0; r < table_width; ++r)
-      table[r * table_width + d] /= norm;
-  }
-  return table;
-}
-
-// world_scale=1, identity origin/rotation: "world" coordinates equal map pixel
-// coordinates directly. Same as mcl_bench.cpp / mcl_bench_lut.cpp.
-static void set_identity_ros_transform(OMap &map) {
-  map.world_scale = 1.0f;
-  map.world_angle = 0.0f;
-  map.world_origin_x = 0.0f;
-  map.world_origin_y = 0.0f;
-  map.world_sin_angle = 0.0f;
-  map.world_cos_angle = 1.0f;
-}
 
 // mirrors ParticleFiler.initialize_global(): draw only from free-space cells.
 // NOTE: deliberately does NOT use map.get() -- that checks OMap's occupied grid
@@ -125,17 +102,6 @@ sample_free_particles(const std::vector<std::pair<int, int>> &free_cells,
     particles[i * 3 + 1] = (float)cell.second;
     particles[i * 3 + 2] = theta_dist(rng);
   }
-}
-
-// -3pi/4 to 3pi/4 (270 deg FOV), same convention as mcl_bench.cpp /
-// mcl_bench_lut.cpp.
-static std::vector<float> make_angles(int n) {
-  std::vector<float> a(n);
-  const float min_angle = -3.0f * (float)M_PI / 4.0f,
-              max_angle = 3.0f * (float)M_PI / 4.0f;
-  for (int i = 0; i < n; ++i)
-    a[i] = min_angle + (max_angle - min_angle) * (float)i / (float)(n - 1);
-  return a;
 }
 
 // One row of ground-truth pose (+velocity, currently unused) per PF iteration.
@@ -560,6 +526,22 @@ static void print_usage(const char *prog) {
       "  --velocity-noise-std  optional: std dev in m/s of the per-particle "
       "odometry speed\n"
       "                noise, default 0.05.\n"
+      "  --motion-dispersion-x      optional: residual isotropic x noise std "
+      "dev in METERS\n"
+      "                (converted to pixels internally via MAP_RESOLUTION, "
+      "same as MIT's\n"
+      "                motion_dispersion_x ROS param), default 0.05. Pass 0 "
+      "for a pure\n"
+      "                dead-reckoning-plus-odometry-noise motion model, no "
+      "residual jitter.\n"
+      "  --motion-dispersion-y      optional: same as above, y axis, default "
+      "0.025.\n"
+      "  --motion-dispersion-theta  optional: residual heading noise std dev "
+      "in RADIANS\n"
+      "                (no unit conversion needed, same as MIT's "
+      "motion_dispersion_theta ROS\n"
+      "                param), default 0.25. Added on top of "
+      "true_delta_theta each iteration.\n"
       "  --init-mode   optional: 'global' (default) scatters the initial "
       "population uniformly\n"
       "                across all free-space cells (global localization). "
@@ -607,6 +589,9 @@ int main(int argc, char **argv) {
   float dt_seconds = 1.0f / 40.0f;
   float nominal_velocity = 1.8f;
   float velocity_noise_std = 0.05f;
+  float motion_dispersion_x = MOTION_DISPERSION_X;
+  float motion_dispersion_y = MOTION_DISPERSION_Y;
+  float motion_dispersion_theta = MOTION_DISPERSION_THETA;
   std::string init_mode = "global";
   float init_std_xy_m = 0.5f;
   float init_std_theta = 0.4f;
@@ -643,6 +628,12 @@ int main(int argc, char **argv) {
       ess_resampling_threshold = std::atof(value);
     else if (arg == "--squash-factor")
       squash_factor = std::atof(value);
+    else if (arg == "--motion-dispersion-x")
+      motion_dispersion_x = std::atof(value);
+    else if (arg == "--motion-dispersion-y")
+      motion_dispersion_y = std::atof(value);
+    else if (arg == "--motion-dispersion-theta")
+      motion_dispersion_theta = std::atof(value);
     else if (arg == "--dt")
       dt_seconds = std::atof(value);
     else if (arg == "--nominal-velocity")
@@ -789,9 +780,9 @@ int main(int argc, char **argv) {
   std::vector<int> proposal_indices(max_particles);
   std::vector<float> obs(num_rays);
 
-  std::normal_distribution<float> noise_x(0.0f, MOTION_DISPERSION_X);
-  std::normal_distribution<float> noise_y(0.0f, MOTION_DISPERSION_Y);
-  std::normal_distribution<float> noise_theta(0.0f, MOTION_DISPERSION_THETA);
+  std::normal_distribution<float> noise_x(0.0f, motion_dispersion_x / MAP_RESOLUTION);
+  std::normal_distribution<float> noise_y(0.0f, motion_dispersion_y / MAP_RESOLUTION);
+  std::normal_distribution<float> noise_theta(0.0f, motion_dispersion_theta);
   std::normal_distribution<float> noise_v(0.0f, velocity_noise_std);
 
   // out_prefix is a directory now (one per run, e.g.

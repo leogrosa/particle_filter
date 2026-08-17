@@ -33,6 +33,14 @@ add_executable(mcl_bench_lut mcl_bench_lut.cpp
     ${RANGE_LIBC_DIR}/vendor/lodepng/lodepng.cpp)
 target_link_libraries(mcl_bench_lut pthread)
 
+# Minimal sensor-model debugging tool: scores one probe pose against one synthetic
+# ground-truth observation and prints a per-ray beam-model breakdown (see
+# likelihood_probe.cpp). Shares mcl_common.h with mcl_convergence.cpp. Local-only /
+# exploratory tool, not gated by WITH_CUDA.
+add_executable(likelihood_probe likelihood_probe.cpp
+    ${RANGE_LIBC_DIR}/vendor/lodepng/lodepng.cpp)
+target_link_libraries(likelihood_probe pthread)
+
 # Per-iteration convergence probe: does particle-filter convergence shrink the memory working set
 # touched by GiantLUTCast's position-indexed giant_lut lookups? Logs every iteration individually
 # (see mcl_convergence.cpp), unlike mcl_bench_lut's averaged WARMUP+TIMED sweep. Local-only /

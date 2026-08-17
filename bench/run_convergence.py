@@ -105,7 +105,8 @@ def _poll_timing_progress(timing_path, iters, stop_event):
 
 def run_binary(particles, rays, iters, seed, out_prefix, trajectory, dt, squash_factor,
                roughening_k, ess_resampling_threshold, init_mode, init_std_xy, init_std_theta,
-               disable_measurement_update):
+               disable_measurement_update, motion_dispersion_x, motion_dispersion_y,
+               motion_dispersion_theta):
     cmd = [
         str(BINARY),
         "--particles", str(particles),
@@ -121,6 +122,9 @@ def run_binary(particles, rays, iters, seed, out_prefix, trajectory, dt, squash_
         "--init-std-xy", str(init_std_xy),
         "--init-std-theta", str(init_std_theta),
         "--disable-measurement-update", "1" if disable_measurement_update else "0",
+        "--motion-dispersion-x", str(motion_dispersion_x),
+        "--motion-dispersion-y", str(motion_dispersion_y),
+        "--motion-dispersion-theta", str(motion_dispersion_theta),
     ]
     if trajectory is not None:
         cmd += ["--trajectory", str(trajectory)]
@@ -211,6 +215,19 @@ def main():
                           "uniform every iteration (ESS reads N, so resample/roughen self-skip "
                           "too), forwarded to the binary's own --disable-measurement-update -- "
                           "isolates the motion model alone, no sensor feedback, for debugging.")
+    ap.add_argument("--motion-dispersion-x", type=float, default=0.05,
+                     help="residual isotropic x noise std dev in meters, forwarded to the "
+                          "binary's own --motion-dispersion-x (converted to pixels internally "
+                          "via MAP_RESOLUTION). Default 0.05, matching MIT's own "
+                          "motion_dispersion_x ROS param. Pass 0 for a zero-process-noise "
+                          "isolation run.")
+    ap.add_argument("--motion-dispersion-y", type=float, default=0.025,
+                     help="same as --motion-dispersion-x, y axis. Default 0.025.")
+    ap.add_argument("--motion-dispersion-theta", type=float, default=0.25,
+                     help="residual heading noise std dev in radians (added on top of "
+                          "true_delta_theta each iteration), forwarded to the binary's own "
+                          "--motion-dispersion-theta. Default 0.25, matching MIT's own "
+                          "motion_dispersion_theta ROS param.")
     ap.add_argument("--seed", type=int, default=42, help="RNG seed (default 42)")
     ap.add_argument("--out-prefix", default=None,
                      help="output directory; the binary writes <dir>/timing.csv, "
@@ -242,7 +259,9 @@ def main():
         f"==> Config: particles={args.particles} rays={args.rays} iters={iters} "
         f"seed={args.seed} squash_factor={args.squash_factor} roughening_k={args.roughening_k} "
         f"ess_resampling_threshold={args.ess_resampling_threshold} init_mode={args.init_mode} "
-        f"disable_measurement_update={args.disable_measurement_update} out_prefix={out_prefix}"
+        f"disable_measurement_update={args.disable_measurement_update} "
+        f"motion_dispersion_x={args.motion_dispersion_x} motion_dispersion_y={args.motion_dispersion_y} "
+        f"motion_dispersion_theta={args.motion_dispersion_theta} out_prefix={out_prefix}"
     )
     if args.init_mode == "tracking":
         logger.info(
@@ -255,7 +274,8 @@ def main():
     run_binary(args.particles, args.rays, iters, args.seed, out_prefix, args.trajectory, args.dt,
                args.squash_factor, args.roughening_k, args.ess_resampling_threshold,
                args.init_mode, args.init_std_xy, args.init_std_theta,
-               args.disable_measurement_update)
+               args.disable_measurement_update, args.motion_dispersion_x,
+               args.motion_dispersion_y, args.motion_dispersion_theta)
 
     timing_csv = out_prefix / "timing.csv"
     particles_csv = out_prefix / "particles.csv"
