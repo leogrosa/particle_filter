@@ -281,41 +281,77 @@ static void compute_working_set_stats(const std::vector<float> &particles,
 // Step: this iteration's synthetic observation, ray-cast from the ground-truth
 // pose. Untimed.
 //
-// ISOLATION TEST (2026-08-17): previously called glt.calc_range(gt.x, gt.y,
-// gt.theta + angles[a]) directly per ray, same as mcl_bench.cpp /
-// mcl_bench_lut.cpp's obs setup -- but that bypasses the ROS world->grid
-// transform that calc_range_repeat_angles_eval_sensor_model (RangeLib.h
-// ~558-612) applies to every PARTICLE before its own calc_range calls: a
-// theta negation + rotation_const (=-3pi/2) offset and an (x,y)->(y,x) swap,
-// applied unconditionally even under our identity world_scale/origin/angle
-// setup. So obs was being ray-cast in one frame while particles were scored
-// against it in a rotated, axis-swapped frame -- a plausible root cause for
-// the symmetric-corridor bug (a consistent wrong bias, not noise, matching
-// the observed symptom). Switched to glt.numpy_calc_range_angles()
-// (RangeLib.h ~482), a public RangeMethod method that applies this exact
-// same transform and returns raw ranges instead of weights -- so obs is now
-// guaranteed to be in the identical convention the real per-particle
-// weighting path uses, instead of a hand-re-derived copy of that transform
-// that could silently drift from RangeLib.h later.
+// History: originally called glt.calc_range(gt.x, gt.y, gt.theta+angles[a])
+// directly per ray. On 2026-08-17 that looked like a frame mismatch against
+// calc_range_repeat_angles_eval_sensor_model's internal ROS world->grid
+// transform (RangeLib.h ~558-612: a theta negation + rotation_const offset
+// + an (x,y)->(y,x) swap, applied unconditionally even under our identity
+// world_scale/origin/angle setup), so this was switched to
+// glt.numpy_calc_range_angles() to match that transform.
+//
+// That "fix" was wrong in direction, confirmed 2026-08-18 with
+// likelihood_probe.cpp: the x/y swap is real, but it's a SWAP relative to
+// how giant_lut/grid are actually stored ([x=col][y=row], per RangeLib.h's
+// OMap decode loop and GiantLUTCast's constructor loop) -- not a frame this
+// benchmark needs to match, a bug in the function itself under our identity
+// setup. A pose that's genuinely free space by grid's own convention, but
+// whose swapped coordinates land on a wall, reads ~0 through
+// numpy_calc_range_angles / calc_range_repeat_angles_eval_sensor_model
+// regardless of angle -- direct, reproducible test, not a guess. The x/y
+// swap alone is cancellable by pre-swapping inputs, but the function's
+// separate heading rotation (rotation_const=-3pi/2) is NOT cancellable by
+// any single compensating constant without also negating the angles array
+// per-ray (worked out 2026-08-18) -- three coupled sign/offset hacks with
+// no upside, since calc_range() itself has none of this baggage.
+//
+// So: back to glt.calc_range() directly, per ray -- and (2026-08-18)
+// measurement_update() below now does the same, so obs and every particle's
+// predicted range are computed in the SAME correct, unswapped convention.
 static void build_ground_truth_observation(GiantLUTCast &glt, const Pose &gt,
                                            std::vector<float> &angles,
                                            std::vector<float> &obs,
                                            int num_rays) {
-  float pose[3] = {gt.x, gt.y, gt.theta};
-  glt.numpy_calc_range_angles(pose, angles.data(), obs.data(), 1, num_rays);
+  for (int a = 0; a < num_rays; ++a)
+    obs[a] = glt.calc_range(gt.x, gt.y, gt.theta + angles[a]);
 }
 
 // Step: update. The one timed region -- lookup + sensor-model eval against
 // every particle. Resample/motion/normalize are deliberately not timed -- this
 // tool cares about one thing only.
+//
+// Was glt.calc_range_repeat_angles_eval_sensor_model() (one fused call over
+// all particles) -- switched 2026-08-18 to an explicit per-particle,
+// per-ray glt.calc_range() loop with the sensor_table looked up directly,
+// for the same reason build_ground_truth_observation() above went back to
+// calc_range(): calc_range_repeat_angles_eval_sensor_model's internal x/y
+// swap + heading rotation don't match giant_lut/grid's actual [col][row]
+// storage under our identity world transform. This loop does the same
+// clamp-then-table-lookup calc_range_repeat_angles_eval_sensor_model did
+// internally (RangeLib.h ~603-607), just without the swap/rotation, using
+// the sensor_table this file already builds via build_sensor_model_table()
+// rather than relying on glt's own uploaded copy (glt.set_sensor_model()
+// upload is now unused by this path, kept only because GiantLUTCast's
+// constructor doesn't offer a way to skip it).
 static double
-measurement_update(GiantLUTCast &glt, std::vector<float> &particles,
+measurement_update(GiantLUTCast &glt, const std::vector<double> &sensor_table,
+                   int table_width, std::vector<float> &particles,
                    std::vector<float> &angles, std::vector<float> &obs,
                    std::vector<double> &new_weights, int n, int num_rays) {
   auto t0 = Clock::now();
-  glt.calc_range_repeat_angles_eval_sensor_model(
-      particles.data(), angles.data(), obs.data(), new_weights.data(), n,
-      num_rays);
+  for (int i = 0; i < n; ++i) {
+    float px = particles[i * 3 + 0];
+    float py = particles[i * 3 + 1];
+    float ptheta = particles[i * 3 + 2];
+    double weight = 1.0;
+    for (int a = 0; a < num_rays; ++a) {
+      float d = glt.calc_range(px, py, ptheta + angles[a]);
+      float r = obs[a];
+      r = std::min(std::max(r, 0.0f), (float)table_width - 1.0f);
+      d = std::min(std::max(d, 0.0f), (float)table_width - 1.0f);
+      weight *= sensor_table[(int)r * table_width + (int)d];
+    }
+    new_weights[i] = weight;
+  }
   auto t1 = Clock::now();
   return std::chrono::duration<double, std::milli>(t1 - t0).count();
 }
@@ -851,8 +887,9 @@ int main(int argc, char **argv) {
                   iter, iters - 1);
       std::fflush(stdout);
     } else {
-      ms_range_sensor = measurement_update(glt, particles, angles, obs,
-                                           new_weights, max_particles, num_rays);
+      ms_range_sensor = measurement_update(glt, sensor_table, table_width, particles,
+                                           angles, obs, new_weights, max_particles,
+                                           num_rays);
       std::printf("[iter %d/%d] measurement update: %.3f ms\n", iter, iters - 1,
                   ms_range_sensor);
       std::fflush(stdout);
