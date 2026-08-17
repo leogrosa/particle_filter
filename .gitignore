@@ -3,3 +3,6 @@
 bench/build*/
 bench/k_hops_samples.csv
 bench/results/*
+*.csv
+*/.DS_Store
+.DS_Store
