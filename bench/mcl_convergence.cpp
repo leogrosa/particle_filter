@@ -37,6 +37,7 @@ static const double Z_SHORT = 0.01, Z_MAX = 0.07, Z_RAND = 0.12, Z_HIT = 0.75,
                     SIGMA_HIT = 8.0;
 static const float MOTION_DISPERSION_X = 0.05f, MOTION_DISPERSION_Y = 0.025f,
                    MOTION_DISPERSION_THETA = 0.25f;
+static const float ESS_RESAMPLING_THRESHOLD_N = 0.2f;
 
 // direct port of ParticleFiler.precompute_sensor_model() from
 // particle_filter.py, same as mcl_bench.cpp / mcl_bench_lut.cpp
@@ -347,6 +348,9 @@ static double compute_ess(const std::vector<double> &weights, int n) {
 
 // Step: resample, weighted by this iteration's just-normalized weights --
 // produces the population the *next* iteration's motion step will start from.
+// Caller (main()) decides WHETHER to call this at all (ESS-above-threshold
+// skip) -- this function always resamples unconditionally when called, so
+// its output (proposal/proposal_indices) is never stale/partially-written.
 static void resample_step(const std::vector<float> &particles,
                           const std::vector<double> &weights,
                           std::vector<float> &proposal,
@@ -383,8 +387,10 @@ static void roughen_step(std::vector<float> &particles, int n, float K,
   for (int i = 1; i < n; ++i) {
     for (int k = 0; k < d; ++k) {
       float v = particles[i * d + k];
-      if (v < min_val[k]) min_val[k] = v;
-      if (v > max_val[k]) max_val[k] = v;
+      if (v < min_val[k])
+        min_val[k] = v;
+      if (v > max_val[k])
+        max_val[k] = v;
     }
   }
   const float n_pow = std::pow((float)n, -1.0f / (float)d);
@@ -687,7 +693,7 @@ int main(int argc, char **argv) {
                 iter, iters - 1, max_particles);
     std::fflush(stdout);
     motion_step(particles, max_particles, rng, dt_seconds, nominal_velocity,
-               noise_v, noise_x, noise_y, noise_theta);
+                noise_v, noise_x, noise_y, noise_theta);
 
     long distinct_cells;
     double mean_dist_to_true, stddev_x, stddev_y;
@@ -736,16 +742,29 @@ int main(int argc, char **argv) {
     // Skip the last iteration's resample -- nothing downstream would ever read
     // it.
     if (iter + 1 < iters) {
-      resample_step(particles, weights, proposal, proposal_indices,
-                    max_particles, rng);
-      particles.swap(proposal);
-      std::printf(
-          "[iter %d/%d] resample: drew %d particles for the next iteration\n",
-          iter, iters - 1, max_particles);
+      // Skip resampling (and, since roughening exists only to counteract
+      // resampling's own sample impoverishment, roughening too) when ESS is
+      // still above threshold -- weights aren't informative enough yet to be
+      // worth redistributing mass over. resample_step is only ever called
+      // when we're actually going to use its output, so proposal/
+      // proposal_indices are never stale when swapped in below.
+      if (ess > ESS_RESAMPLING_THRESHOLD_N * max_particles) {
+        std::printf("[iter %d/%d] ESS=%.1f above threshold (%.1f%% of %d) -- "
+                    "skipping resample\n",
+                    iter, iters - 1, ess,
+                    100.0 * ESS_RESAMPLING_THRESHOLD_N, max_particles);
+      } else {
+        resample_step(particles, weights, proposal, proposal_indices,
+                      max_particles, rng);
+        particles.swap(proposal);
+        std::printf(
+            "[iter %d/%d] resample: drew %d particles for the next iteration\n",
+            iter, iters - 1, max_particles);
 
-      roughen_step(particles, max_particles, roughening_k, rng);
-      std::printf("[iter %d/%d] roughened resampled particles (K=%.3f)\n",
-                  iter, iters - 1, roughening_k);
+        roughen_step(particles, max_particles, roughening_k, rng);
+        std::printf("[iter %d/%d] roughened resampled particles (K=%.3f)\n",
+                    iter, iters - 1, roughening_k);
+      }
     } else {
       std::printf("[iter %d/%d] last iteration -- skipping resample\n", iter,
                   iters - 1);
