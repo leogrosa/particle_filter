@@ -35,6 +35,22 @@ HEADING_ARROW_LEN = 20  # px, deliberately small/subtle -- see plot_convergence.
                         # matching choice for the same true-pose heading arrow
 
 MAP_PNG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "maps", "basement_fixed.png")
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+
+
+def find_most_recent_run(results_dir):
+    """Most recently modified subdirectory of results_dir that has a timing.csv
+    in it (i.e. an actual mcl_convergence --out-prefix run, not e.g. 'old/')."""
+    candidates = []
+    if not os.path.isdir(results_dir):
+        sys.exit(f"error: results directory not found: {results_dir}")
+    for name in os.listdir(results_dir):
+        path = os.path.join(results_dir, name)
+        if os.path.isdir(path) and os.path.exists(os.path.join(path, "timing.csv")):
+            candidates.append(path)
+    if not candidates:
+        sys.exit(f"error: no run directories (containing timing.csv) found under {results_dir}")
+    return max(candidates, key=os.path.getmtime)
 
 
 def load_map():
@@ -65,9 +81,12 @@ def pick_writer(requested_output):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--out-prefix", required=True,
+    ap.add_argument("--out-prefix",
                      help="output directory used with mcl_convergence --out-prefix "
                           "(reads DIR/particles.csv, DIR/trajectory.csv)")
+    ap.add_argument("--recent", "-r", action="store_true",
+                     help=f"use the most recently modified run directory under {RESULTS_DIR} "
+                          "instead of --out-prefix")
     ap.add_argument("--output", default=None,
                      help="output video/gif path (default: <out-prefix>/animation.mp4, "
                           "falls back to .gif if the ffmpeg writer is unavailable)")
@@ -85,13 +104,23 @@ def main():
     args = ap.parse_args()
     fps = args.fps if args.fps is not None else 1.0 / args.dt
 
-    particles_csv = require_csv(f"{args.out_prefix}/particles.csv")
-    trajectory_csv = require_csv(f"{args.out_prefix}/trajectory.csv")
+    if args.recent:
+        if args.out_prefix:
+            sys.exit("error: --out-prefix and --recent/-r are mutually exclusive")
+        out_prefix = find_most_recent_run(RESULTS_DIR)
+        print(f"using most recent run: {out_prefix}")
+    elif args.out_prefix:
+        out_prefix = args.out_prefix
+    else:
+        sys.exit("error: one of --out-prefix or --recent/-r is required")
+
+    particles_csv = require_csv(f"{out_prefix}/particles.csv")
+    trajectory_csv = require_csv(f"{out_prefix}/trajectory.csv")
 
     particles = pd.read_csv(particles_csv)
     traj = pd.read_csv(trajectory_csv).set_index("iter")
 
-    requested_output = args.output or f"{args.out_prefix}/animation.mp4"
+    requested_output = args.output or f"{out_prefix}/animation.mp4"
     writer_name, output_path = pick_writer(requested_output)
 
     img, w, h = load_map()
