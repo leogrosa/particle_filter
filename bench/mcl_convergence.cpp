@@ -143,6 +143,25 @@ struct Pose {
   float t = 0.0f, x = 0.0f, y = 0.0f, theta = 0.0f, vx = 0.0f, vy = 0.0f;
 };
 
+// Tracking-problem initialization (as opposed to sample_free_particles'
+// global-localization scatter above): draws each particle from an
+// independent Gaussian centered on a known pose (e.g. trajectory[0]),
+// instead of uniformly across the whole map. No free-space check -- keep
+// std_xy_px/std_theta small enough that this stays valid.
+static void sample_gaussian_particles(const Pose &pose, float std_xy_px,
+                                      float std_theta,
+                                      std::vector<float> &particles, int n,
+                                      std::mt19937 &rng) {
+  std::normal_distribution<float> x_dist(pose.x, std_xy_px);
+  std::normal_distribution<float> y_dist(pose.y, std_xy_px);
+  std::normal_distribution<float> theta_dist(pose.theta, std_theta);
+  for (int i = 0; i < n; ++i) {
+    particles[i * 3 + 0] = x_dist(rng);
+    particles[i * 3 + 1] = y_dist(rng);
+    particles[i * 3 + 2] = theta_dist(rng);
+  }
+}
+
 // Reads iter,t,x,y,theta,vx,vy rows (one header line, skipped) from a
 // caller-supplied trajectory CSV -- vx,vy are parsed but ignored for now. This
 // file-based path exists so a future phase can point this same binary at a real
@@ -206,17 +225,40 @@ static bool load_trajectory_csv(const std::string &path, int iters,
 // start of the run. Under this ordering, only the last iteration has no next
 // iteration to feed, so main() skips its resample instead.
 
+// Wraps an angle to (-pi, pi] -- needed before diffing two headings, since a
+// raw theta[iter] - theta[iter-1] can spuriously jump by ~2*pi when either
+// value crosses the wraparound boundary even though the true turn was small.
+static float wrap_angle(float a) {
+  while (a > (float)M_PI)
+    a -= 2.0f * (float)M_PI;
+  while (a <= -(float)M_PI)
+    a += 2.0f * (float)M_PI;
+  return a;
+}
+
 // Step: predict. Each particle draws its own noisy "odometry" speed reading
 // (nominal_velocity +/- noise_v -- stands in for a real wheel-odometry/IMU
 // speed estimate, since we don't have one) and propagates x,y forward along
 // its OWN current heading by that speed * dt, converted from meters to pixels
 // via MAP_RESOLUTION. Heading is read before noise_theta perturbs it, so the
 // propagation direction matches the pose the particle actually represents
-// this iteration. The old isotropic noise_x/noise_y/noise_theta jitter is
-// still applied on top -- it now represents residual unmodeled motion (lateral
-// slip, heading-independent drift) rather than being the only motion signal.
+// this iteration. The old isotropic noise_x/noise_y jitter is still applied
+// on top -- it now represents residual unmodeled motion (lateral slip,
+// heading-independent drift) rather than being the only motion signal.
+//
+// true_delta_theta is the ground-truth heading's own change this iteration
+// (trajectory[iter].theta - trajectory[iter-1].theta, wrapped; 0 at iter 0
+// or in stand-still mode) -- standing in for a real odometry yaw-rate
+// reading, same structure as MIT's particle_filter.py motion_model()
+// (local_deltas[:,2] = action[2], the sensed delta-heading from odomCB,
+// applied identically to every particle before per-particle noise). Without
+// this, theta was a pure random walk with zero coupling to the actual path,
+// so particles could never track a turn regardless of noise tuning --
+// diagnosed 2026-08-17 via a --disable-measurement-update dead-reckoning
+// isolation test. noise_theta now represents odometry sensing error on top
+// of this true signal, not the entire heading update.
 static void motion_step(std::vector<float> &particles, int n, std::mt19937 &rng,
-                        float dt, float nominal_velocity,
+                        float dt, float nominal_velocity, float true_delta_theta,
                         std::normal_distribution<float> &noise_v,
                         std::normal_distribution<float> &noise_x,
                         std::normal_distribution<float> &noise_y,
@@ -229,7 +271,7 @@ static void motion_step(std::vector<float> &particles, int n, std::mt19937 &rng,
     particles[i * 3 + 1] += dist_px * std::sin(heading);
     particles[i * 3 + 0] += noise_x(rng);
     particles[i * 3 + 1] += noise_y(rng);
-    particles[i * 3 + 2] += noise_theta(rng);
+    particles[i * 3 + 2] += true_delta_theta + noise_theta(rng);
   }
 }
 
@@ -501,6 +543,28 @@ static void print_usage(const char *prog) {
       "  --velocity-noise-std  optional: std dev in m/s of the per-particle "
       "odometry speed\n"
       "                noise, default 0.05.\n"
+      "  --init-mode   optional: 'global' (default) scatters the initial "
+      "population uniformly\n"
+      "                across all free-space cells (global localization). "
+      "'tracking' instead\n"
+      "                draws it from a Gaussian centered on the ground-truth "
+      "pose at iteration 0\n"
+      "                (--init-std-xy / --init-std-theta), simulating a known "
+      "starting pose.\n"
+      "  --init-std-xy     optional: position std dev in meters for "
+      "--init-mode tracking,\n"
+      "                default 0.5.\n"
+      "  --init-std-theta  optional: heading std dev in radians for "
+      "--init-mode tracking,\n"
+      "                default 0.4.\n"
+      "  --disable-measurement-update  optional: 0 (default) or 1. When 1, "
+      "skips\n"
+      "                measurement_update/squash/normalize entirely and sets "
+      "weights uniform\n"
+      "                every iteration (ESS reads N, so resample/roughen "
+      "self-skip too) --\n"
+      "                isolates the motion model alone, no sensor feedback, "
+      "for debugging.\n"
       "\n"
       "Runs GiantLUTCast's real MCL hot path (see mcl_bench_lut.cpp) for "
       "--iters iterations,\n"
@@ -526,6 +590,10 @@ int main(int argc, char **argv) {
   float dt_seconds = 1.0f / 40.0f;
   float nominal_velocity = 1.8f;
   float velocity_noise_std = 0.05f;
+  std::string init_mode = "global";
+  float init_std_xy_m = 0.5f;
+  float init_std_theta = 0.4f;
+  bool disable_measurement_update = false;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -564,6 +632,14 @@ int main(int argc, char **argv) {
       nominal_velocity = std::atof(value);
     else if (arg == "--velocity-noise-std")
       velocity_noise_std = std::atof(value);
+    else if (arg == "--init-mode")
+      init_mode = value;
+    else if (arg == "--init-std-xy")
+      init_std_xy_m = std::atof(value);
+    else if (arg == "--init-std-theta")
+      init_std_theta = std::atof(value);
+    else if (arg == "--disable-measurement-update")
+      disable_measurement_update = std::atoi(value) != 0;
     else {
       std::fprintf(stderr, "unknown argument: %s\n", arg.c_str());
       print_usage(argv[0]);
@@ -572,6 +648,12 @@ int main(int argc, char **argv) {
   }
   if (max_particles <= 0 || num_rays <= 0 || iters <= 0 || !have_seed ||
       out_prefix.empty()) {
+    print_usage(argv[0]);
+    return 1;
+  }
+  if (init_mode != "global" && init_mode != "tracking") {
+    std::fprintf(stderr, "--init-mode must be 'global' or 'tracking', got: %s\n",
+                 init_mode.c_str());
     print_usage(argv[0]);
     return 1;
   }
@@ -662,15 +744,26 @@ int main(int argc, char **argv) {
               trajectory[0].x, trajectory[0].y, trajectory[0].theta);
   std::fflush(stdout);
 
-  // Iteration 0 starts from a uniformly-scattered-across-all-free-space
-  // population with uniform weights, same as mcl_bench.cpp /
-  // mcl_bench_lut.cpp's bench_point().
-  std::printf("[setup] sampling %d initial free-space particles\n",
-              max_particles);
-  std::fflush(stdout);
+  // Iteration 0 starts from either a uniformly-scattered-across-all-free-space
+  // population (global localization, same as mcl_bench.cpp /
+  // mcl_bench_lut.cpp's bench_point()), or a Gaussian centered on the
+  // ground-truth pose (tracking problem -- known starting pose).
   std::vector<float> particles(max_particles * 3);
   std::vector<double> weights(max_particles);
-  sample_free_particles(free_cells, particles, max_particles, rng);
+  if (init_mode == "tracking") {
+    float init_std_xy_px = init_std_xy_m / MAP_RESOLUTION;
+    std::printf("[setup] sampling %d initial particles: Gaussian around "
+                "iter-0 pose (std_xy=%.3fm=%.1fpx, std_theta=%.3frad)\n",
+                max_particles, init_std_xy_m, init_std_xy_px, init_std_theta);
+    std::fflush(stdout);
+    sample_gaussian_particles(trajectory[0], init_std_xy_px, init_std_theta,
+                              particles, max_particles, rng);
+  } else {
+    std::printf("[setup] sampling %d initial free-space particles\n",
+                max_particles);
+    std::fflush(stdout);
+    sample_free_particles(free_cells, particles, max_particles, rng);
+  }
   std::printf("[setup] initial particles sampled\n");
   std::fflush(stdout);
 
@@ -716,11 +809,15 @@ int main(int argc, char **argv) {
     const Pose &gt = trajectory[iter];
     log_trajectory_row(f_trajectory, iter, gt);
 
-    std::printf("[iter %d/%d] motion: applying process noise to %d particles\n",
-                iter, iters - 1, max_particles);
+    float true_delta_theta =
+        (iter == 0) ? 0.0f
+                    : wrap_angle(trajectory[iter].theta - trajectory[iter - 1].theta);
+    std::printf("[iter %d/%d] motion: applying process noise to %d particles "
+                "(true_delta_theta=%.4f)\n",
+                iter, iters - 1, max_particles, true_delta_theta);
     std::fflush(stdout);
     motion_step(particles, max_particles, rng, dt_seconds, nominal_velocity,
-                noise_v, noise_x, noise_y, noise_theta);
+                true_delta_theta, noise_v, noise_x, noise_y, noise_theta);
 
     long distinct_cells;
     double mean_dist_to_true, stddev_x, stddev_y;
@@ -737,20 +834,30 @@ int main(int argc, char **argv) {
                 iters - 1, num_rays);
     std::fflush(stdout);
 
-    double ms_range_sensor = measurement_update(
-        glt, particles, angles, obs, new_weights, max_particles, num_rays);
-    std::printf("[iter %d/%d] measurement update: %.3f ms\n", iter, iters - 1,
-                ms_range_sensor);
-    std::fflush(stdout);
+    double ms_range_sensor = 0.0;
+    if (disable_measurement_update) {
+      for (int i = 0; i < max_particles; ++i)
+        weights[i] = 1.0 / max_particles;
+      std::printf("[iter %d/%d] measurement update disabled -- weights set "
+                  "uniform\n",
+                  iter, iters - 1);
+      std::fflush(stdout);
+    } else {
+      ms_range_sensor = measurement_update(glt, particles, angles, obs,
+                                           new_weights, max_particles, num_rays);
+      std::printf("[iter %d/%d] measurement update: %.3f ms\n", iter, iters - 1,
+                  ms_range_sensor);
+      std::fflush(stdout);
 
-    squash_weights(new_weights, max_particles, squash_factor);
-    std::printf("[iter %d/%d] squashed weights (squash_factor=%.3f)\n", iter,
-                iters - 1, squash_factor);
-    std::fflush(stdout);
+      squash_weights(new_weights, max_particles, squash_factor);
+      std::printf("[iter %d/%d] squashed weights (squash_factor=%.3f)\n", iter,
+                  iters - 1, squash_factor);
+      std::fflush(stdout);
 
-    normalize_weights(new_weights, weights, max_particles);
-    std::printf("[iter %d/%d] normalized weights\n", iter, iters - 1);
-    std::fflush(stdout);
+      normalize_weights(new_weights, weights, max_particles);
+      std::printf("[iter %d/%d] normalized weights\n", iter, iters - 1);
+      std::fflush(stdout);
+    }
 
     double ess = compute_ess(weights, max_particles);
     std::printf("[iter %d/%d] effective sample size: ESS=%.1f (%.1f%% of %d "

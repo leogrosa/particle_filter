@@ -104,7 +104,8 @@ def _poll_timing_progress(timing_path, iters, stop_event):
 
 
 def run_binary(particles, rays, iters, seed, out_prefix, trajectory, dt, squash_factor,
-               roughening_k, ess_resampling_threshold):
+               roughening_k, ess_resampling_threshold, init_mode, init_std_xy, init_std_theta,
+               disable_measurement_update):
     cmd = [
         str(BINARY),
         "--particles", str(particles),
@@ -116,6 +117,10 @@ def run_binary(particles, rays, iters, seed, out_prefix, trajectory, dt, squash_
         "--squash-factor", str(squash_factor),
         "--roughening-k", str(roughening_k),
         "--ess-resampling-threshold", str(ess_resampling_threshold),
+        "--init-mode", str(init_mode),
+        "--init-std-xy", str(init_std_xy),
+        "--init-std-theta", str(init_std_theta),
+        "--disable-measurement-update", "1" if disable_measurement_update else "0",
     ]
     if trajectory is not None:
         cmd += ["--trajectory", str(trajectory)]
@@ -189,6 +194,23 @@ def main():
                           "(see mcl_convergence.cpp's resample skip logic, "
                           "papers/16831_lecture05_gseyfarth_zbatts.pdf). Default 0.2; 0 "
                           "disables skipping (always resample).")
+    ap.add_argument("--init-mode", choices=["global", "tracking"], default="global",
+                     help="forwarded to the binary's own --init-mode. 'global' (default) "
+                          "scatters the initial population uniformly across all free-space "
+                          "cells (global localization). 'tracking' draws it from a Gaussian "
+                          "centered on the ground-truth pose at iteration 0 (--init-std-xy / "
+                          "--init-std-theta), simulating a known starting pose.")
+    ap.add_argument("--init-std-xy", type=float, default=0.5,
+                     help="position std dev in meters for --init-mode tracking, forwarded to "
+                          "the binary's own --init-std-xy. Default 0.5.")
+    ap.add_argument("--init-std-theta", type=float, default=0.4,
+                     help="heading std dev in radians for --init-mode tracking, forwarded to "
+                          "the binary's own --init-std-theta. Default 0.4.")
+    ap.add_argument("--disable-measurement-update", action="store_true",
+                     help="skip measurement_update/squash/normalize entirely and set weights "
+                          "uniform every iteration (ESS reads N, so resample/roughen self-skip "
+                          "too), forwarded to the binary's own --disable-measurement-update -- "
+                          "isolates the motion model alone, no sensor feedback, for debugging.")
     ap.add_argument("--seed", type=int, default=42, help="RNG seed (default 42)")
     ap.add_argument("--out-prefix", default=None,
                      help="output directory; the binary writes <dir>/timing.csv, "
@@ -219,14 +241,21 @@ def main():
     logger.info(
         f"==> Config: particles={args.particles} rays={args.rays} iters={iters} "
         f"seed={args.seed} squash_factor={args.squash_factor} roughening_k={args.roughening_k} "
-        f"ess_resampling_threshold={args.ess_resampling_threshold} out_prefix={out_prefix}"
+        f"ess_resampling_threshold={args.ess_resampling_threshold} init_mode={args.init_mode} "
+        f"disable_measurement_update={args.disable_measurement_update} out_prefix={out_prefix}"
     )
+    if args.init_mode == "tracking":
+        logger.info(
+            f"==> init_std_xy={args.init_std_xy}m init_std_theta={args.init_std_theta}rad"
+        )
     if args.trajectory is not None:
         logger.info(f"==> Forwarding --trajectory {args.trajectory}")
 
     build_binary()
     run_binary(args.particles, args.rays, iters, args.seed, out_prefix, args.trajectory, args.dt,
-               args.squash_factor, args.roughening_k, args.ess_resampling_threshold)
+               args.squash_factor, args.roughening_k, args.ess_resampling_threshold,
+               args.init_mode, args.init_std_xy, args.init_std_theta,
+               args.disable_measurement_update)
 
     timing_csv = out_prefix / "timing.csv"
     particles_csv = out_prefix / "particles.csv"
