@@ -313,13 +313,30 @@ static void compute_working_set_stats(const std::vector<float> &particles,
 }
 
 // Step: this iteration's synthetic observation, ray-cast from the ground-truth
-// pose. Untimed, same as mcl_bench.cpp / mcl_bench_lut.cpp's obs setup.
+// pose. Untimed.
+//
+// ISOLATION TEST (2026-08-17): previously called glt.calc_range(gt.x, gt.y,
+// gt.theta + angles[a]) directly per ray, same as mcl_bench.cpp /
+// mcl_bench_lut.cpp's obs setup -- but that bypasses the ROS world->grid
+// transform that calc_range_repeat_angles_eval_sensor_model (RangeLib.h
+// ~558-612) applies to every PARTICLE before its own calc_range calls: a
+// theta negation + rotation_const (=-3pi/2) offset and an (x,y)->(y,x) swap,
+// applied unconditionally even under our identity world_scale/origin/angle
+// setup. So obs was being ray-cast in one frame while particles were scored
+// against it in a rotated, axis-swapped frame -- a plausible root cause for
+// the symmetric-corridor bug (a consistent wrong bias, not noise, matching
+// the observed symptom). Switched to glt.numpy_calc_range_angles()
+// (RangeLib.h ~482), a public RangeMethod method that applies this exact
+// same transform and returns raw ranges instead of weights -- so obs is now
+// guaranteed to be in the identical convention the real per-particle
+// weighting path uses, instead of a hand-re-derived copy of that transform
+// that could silently drift from RangeLib.h later.
 static void build_ground_truth_observation(GiantLUTCast &glt, const Pose &gt,
                                            std::vector<float> &angles,
                                            std::vector<float> &obs,
                                            int num_rays) {
-  for (int a = 0; a < num_rays; ++a)
-    obs[a] = glt.calc_range(gt.x, gt.y, gt.theta + angles[a]);
+  float pose[3] = {gt.x, gt.y, gt.theta};
+  glt.numpy_calc_range_angles(pose, angles.data(), obs.data(), 1, num_rays);
 }
 
 // Step: update. The one timed region -- lookup + sensor-model eval against

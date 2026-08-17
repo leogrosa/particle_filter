@@ -188,7 +188,7 @@ def main():
                           "forwarded to the binary's own --roughening-k. "
                           "sigma_i = K * E_i * N^(-1/d) added to each particle dimension "
                           "right after resampling. Default 0.2; K=0 disables roughening.")
-    ap.add_argument("--ess-resampling-threshold", type=float, default=0.2,
+    ap.add_argument("--ess-resampling-threshold", type=float, default=0.5,
                      help="skip resampling (and roughening) when ESS is above this fraction "
                           "of N, forwarded to the binary's own --ess-resampling-threshold "
                           "(see mcl_convergence.cpp's resample skip logic, "
