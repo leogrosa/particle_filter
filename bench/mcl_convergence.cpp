@@ -1,5 +1,5 @@
-#include "range_libc/includes/RangeLib.h"
 #include "mcl_common.h"
+#include "range_libc/includes/RangeLib.h"
 
 #include <chrono>
 #include <cmath>
@@ -224,7 +224,8 @@ static float wrap_angle(float a) {
 // isolation test. noise_theta now represents odometry sensing error on top
 // of this true signal, not the entire heading update.
 static void motion_step(std::vector<float> &particles, int n, std::mt19937 &rng,
-                        float dt, float nominal_velocity, float true_delta_theta,
+                        float dt, float nominal_velocity,
+                        float true_delta_theta,
                         std::normal_distribution<float> &noise_v,
                         std::normal_distribution<float> &noise_x,
                         std::normal_distribution<float> &noise_y,
@@ -696,7 +697,8 @@ int main(int argc, char **argv) {
     return 1;
   }
   if (init_mode != "global" && init_mode != "tracking") {
-    std::fprintf(stderr, "--init-mode must be 'global' or 'tracking', got: %s\n",
+    std::fprintf(stderr,
+                 "--init-mode must be 'global' or 'tracking', got: %s\n",
                  init_mode.c_str());
     print_usage(argv[0]);
     return 1;
@@ -816,8 +818,10 @@ int main(int argc, char **argv) {
   std::vector<int> proposal_indices(max_particles);
   std::vector<float> obs(num_rays);
 
-  std::normal_distribution<float> noise_x(0.0f, motion_dispersion_x / MAP_RESOLUTION);
-  std::normal_distribution<float> noise_y(0.0f, motion_dispersion_y / MAP_RESOLUTION);
+  std::normal_distribution<float> noise_x(0.0f,
+                                          motion_dispersion_x / MAP_RESOLUTION);
+  std::normal_distribution<float> noise_y(0.0f,
+                                          motion_dispersion_y / MAP_RESOLUTION);
   std::normal_distribution<float> noise_theta(0.0f, motion_dispersion_theta);
   std::normal_distribution<float> noise_v(0.0f, velocity_noise_std);
 
@@ -854,8 +858,9 @@ int main(int argc, char **argv) {
     log_trajectory_row(f_trajectory, iter, gt);
 
     float true_delta_theta =
-        (iter == 0) ? 0.0f
-                    : wrap_angle(trajectory[iter].theta - trajectory[iter - 1].theta);
+        (iter == 0)
+            ? 0.0f
+            : wrap_angle(trajectory[iter].theta - trajectory[iter - 1].theta);
     std::printf("[iter %d/%d] motion: applying process noise to %d particles "
                 "(true_delta_theta=%.4f)\n",
                 iter, iters - 1, max_particles, true_delta_theta);
@@ -887,9 +892,9 @@ int main(int argc, char **argv) {
                   iter, iters - 1);
       std::fflush(stdout);
     } else {
-      ms_range_sensor = measurement_update(glt, sensor_table, table_width, particles,
-                                           angles, obs, new_weights, max_particles,
-                                           num_rays);
+      ms_range_sensor =
+          measurement_update(glt, sensor_table, table_width, particles, angles,
+                             obs, new_weights, max_particles, num_rays);
       std::printf("[iter %d/%d] measurement update: %.3f ms\n", iter, iters - 1,
                   ms_range_sensor);
       std::fflush(stdout);
@@ -918,35 +923,28 @@ int main(int argc, char **argv) {
                 iters - 1);
     std::fflush(stdout);
 
-    // Skip the last iteration's resample -- nothing downstream would ever read
-    // it.
-    if (iter + 1 < iters) {
-      // Skip resampling (and, since roughening exists only to counteract
-      // resampling's own sample impoverishment, roughening too) when ESS is
-      // still above threshold -- weights aren't informative enough yet to be
-      // worth redistributing mass over. resample_step is only ever called
-      // when we're actually going to use its output, so proposal/
-      // proposal_indices are never stale when swapped in below.
-      if (ess > ess_resampling_threshold * max_particles) {
-        std::printf("[iter %d/%d] ESS=%.1f above threshold (%.1f%% of %d) -- "
-                    "skipping resample\n",
-                    iter, iters - 1, ess,
-                    100.0 * ess_resampling_threshold, max_particles);
-      } else {
-        resample_step(particles, weights, proposal, proposal_indices,
-                      max_particles, rng);
-        particles.swap(proposal);
-        std::printf(
-            "[iter %d/%d] resample: drew %d particles for the next iteration\n",
-            iter, iters - 1, max_particles);
-
-        roughen_step(particles, max_particles, roughening_k, rng);
-        std::printf("[iter %d/%d] roughened resampled particles (K=%.3f)\n",
-                    iter, iters - 1, roughening_k);
-      }
+    // Skip resampling (and, since roughening exists only to counteract
+    // resampling's own sample impoverishment, roughening too) when ESS is
+    // still above threshold -- weights aren't informative enough yet to be
+    // worth redistributing mass over. resample_step is only ever called
+    // when we're actually going to use its output, so proposal/
+    // proposal_indices are never stale when swapped in below.
+    if (ess > ess_resampling_threshold * max_particles) {
+      std::printf("[iter %d/%d] ESS=%.1f above threshold (%.1f%% of %d) -- "
+                  "skipping resample\n",
+                  iter, iters - 1, ess, 100.0 * ess_resampling_threshold,
+                  max_particles);
     } else {
-      std::printf("[iter %d/%d] last iteration -- skipping resample\n", iter,
-                  iters - 1);
+      resample_step(particles, weights, proposal, proposal_indices,
+                    max_particles, rng);
+      particles.swap(proposal);
+      std::printf(
+          "[iter %d/%d] resample: drew %d particles for the next iteration\n",
+          iter, iters - 1, max_particles);
+
+      roughen_step(particles, max_particles, roughening_k, rng);
+      std::printf("[iter %d/%d] roughened resampled particles (K=%.3f)\n", iter,
+                  iters - 1, roughening_k);
     }
     std::fflush(stdout);
   }
