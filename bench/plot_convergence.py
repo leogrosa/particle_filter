@@ -2,9 +2,9 @@
 """
 Renders two static figures from the CSVs produced by `mcl_convergence --out-prefix DIR`:
 
-  <base>/convergence.png -- 3 stacked subplots (distinct_cells, mean_dist_to_true w/
-                             stddev_x/stddev_y, ms_range_sensor) vs iteration number,
-                             read from DIR/timing.csv only.
+  <base>/convergence.png -- 4 stacked subplots (distinct_cells, mean_dist_to_true w/
+                             stddev_x/stddev_y, ms_range_sensor, distinct_triples) vs
+                             iteration number, read from DIR/timing.csv only.
   <base>/snapshots.png   -- small-multiples scatter of the particle cloud at a handful
                              of iterations (first / ~25% / ~50% / ~75% / last, adapted
                              to however many iterations are actually present), colored
@@ -68,12 +68,12 @@ def require_csv(path):
 def plot_convergence_panel(timing_csv, output, tag):
     df = pd.read_csv(timing_csv)
 
-    fig, axes = plt.subplots(3, 1, figsize=(9, 10), sharex=True)
+    fig, axes = plt.subplots(4, 1, figsize=(9, 13), sharex=True)
 
     ax = axes[0]
     ax.plot(df["iter"], df["distinct_cells"], color="#1f77b4", marker="o", markersize=3)
     ax.set_ylabel("distinct cells touched")
-    ax.set_title("Working-set size: distinct map cells touched by lookups this iteration")
+    ax.set_title("Working-set size: distinct map cells (x,y) touched by lookups this iteration")
     ax.grid(alpha=0.3)
 
     # mean_dist_to_true and stddev_x/stddev_y are all pixel-distance quantities, so they
@@ -92,9 +92,22 @@ def plot_convergence_panel(timing_csv, output, tag):
 
     ax = axes[2]
     ax.plot(df["iter"], df["ms_range_sensor"], color="#ff7f0e", marker="o", markersize=3)
-    ax.set_xlabel("iteration")
     ax.set_ylabel("ms_range_sensor\n(local dev-machine, directional only)")
     ax.set_title("Range-sensor lookup wall-clock -- NOT a hardware-calibrated figure")
+    ax.grid(alpha=0.3)
+
+    # distinct_cells only tracks (x,y) -- two particles at the same cell but different
+    # headings look identical to it. distinct_triples additionally tracks the theta bin
+    # actually looked up per ray (glt.discretize_theta(ptheta+angle)), so it's the true
+    # count of distinct giant_lut LEAF entries touched, not just distinct ROWS -- see the
+    # 2026-09-17 project memory entry for why the two can diverge (e.g. ~2x in the
+    # scattered/non-converged case, since most rows there are only ~half-covered by a
+    # single particle's own ray fan, not fully touched the way the converged case is).
+    ax = axes[3]
+    ax.plot(df["iter"], df["distinct_triples"], color="#8c564b", marker="o", markersize=3)
+    ax.set_xlabel("iteration")
+    ax.set_ylabel("distinct (x,y,theta_bin)\ntriples touched")
+    ax.set_title("True LUT leaf-entry footprint: distinct (x,y,theta) triples touched this iteration")
     ax.grid(alpha=0.3)
 
     fig.suptitle(f"PF convergence vs. lookup working set -- {tag}", fontsize=13)

@@ -25,6 +25,7 @@ roughly every iters//20 iterations after that -- both best-effort, since no flus
 the binary's own CSV writes, so rows may arrive in bursts rather than smoothly.
 """
 import argparse
+import csv
 import math
 import subprocess
 import sys
@@ -92,12 +93,17 @@ def _poll_timing_progress(timing_path, iters, stop_event):
         time.sleep(1.0)
         if not timing_path.exists():
             continue
+        # Parsed by header name (not positional split/unpack) so adding/reordering
+        # timing.csv columns (e.g. distinct_triples, 2026-09-17) doesn't silently break
+        # this poller the way a hardcoded-column-count unpack did once already (ess).
         with open(timing_path) as f:
-            rows = f.read().splitlines()[1:]  # skip header
+            rows = list(csv.DictReader(f))
         n = len(rows)
         if n > last_reported and n >= next_threshold:
-            iter_val, _, _, _, _, ms_range_sensor, ess = rows[n - 1].split(",")
-            logger.info(f"    iter {iter_val}/{iters} ({100 * n // iters}%) -- ms_range_sensor={float(ms_range_sensor):.3f} ess={float(ess):.1f}")
+            row = rows[n - 1]
+            logger.info(f"    iter {row['iter']}/{iters} ({100 * n // iters}%) -- "
+                        f"ms_range_sensor={float(row['ms_range_sensor']):.3f} "
+                        f"ess={float(row['ess']):.1f}")
             last_reported = n
             while next_threshold <= n:
                 next_threshold += progress_interval

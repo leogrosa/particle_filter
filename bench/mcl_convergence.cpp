@@ -333,11 +333,46 @@ static void build_ground_truth_observation(GiantLUTCast &glt, const Pose &gt,
 // rather than relying on glt's own uploaded copy (glt.set_sensor_model()
 // upload is now unused by this path, kept only because GiantLUTCast's
 // constructor doesn't offer a way to skip it).
+// Untimed, deliberately -- runs before the clock starts below. Logs the full
+// (x, y, theta_bin) triple for every ray/particle query this iteration (same
+// packed-key-into-unordered_set pattern compute_working_set_stats already
+// uses for distinct_cells, just extended with the theta dimension), so we
+// know exactly how many distinct giant_lut leaf ENTRIES get touched, not
+// just how many distinct (x,y) ROWS -- distinct_cells alone can't tell
+// whether a row's other theta-bins are also being hit by other particles
+// sharing that cell. glt.discretize_theta() is public (RangeLib.h), so this
+// calls the real binning function directly rather than a hand-copied
+// replica (unlike the LUT_CLOCK_SPLIT experiment in mcl_bench_lut.cpp,
+// which had to reimplement it because it's called from a free function, not
+// a method with access to glt).
+static long compute_distinct_triples(GiantLUTCast &glt,
+                                     const std::vector<float> &particles,
+                                     const std::vector<float> &angles, int n,
+                                     int num_rays) {
+  std::unordered_set<long long> triple_set;
+  for (int i = 0; i < n; ++i) {
+    float px = particles[i * 3 + 0];
+    float py = particles[i * 3 + 1];
+    float ptheta = particles[i * 3 + 2];
+    int ix = (int)px, iy = (int)py;
+    for (int a = 0; a < num_rays; ++a) {
+      int theta_bin = glt.discretize_theta(ptheta + angles[a]);
+      long long key = (((long long)ix) << 32) | (((long long)iy) << 8) |
+                      (unsigned int)theta_bin;
+      triple_set.insert(key);
+    }
+  }
+  return (long)triple_set.size();
+}
+
 static double
 measurement_update(GiantLUTCast &glt, const std::vector<double> &sensor_table,
                    int table_width, std::vector<float> &particles,
                    std::vector<float> &angles, std::vector<float> &obs,
-                   std::vector<double> &new_weights, int n, int num_rays) {
+                   std::vector<double> &new_weights, int n, int num_rays,
+                   long &distinct_triples) {
+  distinct_triples = compute_distinct_triples(glt, particles, angles, n, num_rays);
+
   auto t0 = Clock::now();
   for (int i = 0; i < n; ++i) {
     float px = particles[i * 3 + 0];
@@ -504,9 +539,10 @@ static void log_particles(FILE *f, int iter,
 static void log_timing_row(FILE *f, int iter, long distinct_cells,
                            double mean_dist_to_true, double stddev_x,
                            double stddev_y, double ms_range_sensor,
-                           double ess) {
-  std::fprintf(f, "%d,%ld,%.6f,%.6f,%.6f,%.6f,%.6f\n", iter, distinct_cells,
-               mean_dist_to_true, stddev_x, stddev_y, ms_range_sensor, ess);
+                           double ess, long distinct_triples) {
+  std::fprintf(f, "%d,%ld,%.6f,%.6f,%.6f,%.6f,%.6f,%ld\n", iter, distinct_cells,
+               mean_dist_to_true, stddev_x, stddev_y, ms_range_sensor, ess,
+               distinct_triples);
 }
 
 static void print_usage(const char *prog) {
@@ -845,7 +881,7 @@ int main(int argc, char **argv) {
   }
 
   std::fprintf(f_timing, "iter,distinct_cells,mean_dist_to_true,stddev_x,"
-                         "stddev_y,ms_range_sensor,ess\n");
+                         "stddev_y,ms_range_sensor,ess,distinct_triples\n");
   std::fprintf(f_particles, "iter,particle_id,x,y,theta,weight\n");
   std::fprintf(f_trajectory, "iter,t,x,y,theta,vx,vy\n");
 
@@ -884,6 +920,7 @@ int main(int argc, char **argv) {
     std::fflush(stdout);
 
     double ms_range_sensor = 0.0;
+    long distinct_triples = 0;
     if (disable_measurement_update) {
       for (int i = 0; i < max_particles; ++i)
         weights[i] = 1.0 / max_particles;
@@ -894,9 +931,10 @@ int main(int argc, char **argv) {
     } else {
       ms_range_sensor =
           measurement_update(glt, sensor_table, table_width, particles, angles,
-                             obs, new_weights, max_particles, num_rays);
-      std::printf("[iter %d/%d] measurement update: %.3f ms\n", iter, iters - 1,
-                  ms_range_sensor);
+                             obs, new_weights, max_particles, num_rays,
+                             distinct_triples);
+      std::printf("[iter %d/%d] measurement update: %.3f ms (distinct_triples=%ld)\n",
+                  iter, iters - 1, ms_range_sensor, distinct_triples);
       std::fflush(stdout);
 
       squash_weights(new_weights, max_particles, squash_factor);
@@ -918,7 +956,7 @@ int main(int argc, char **argv) {
 
     log_particles(f_particles, iter, particles, weights, max_particles);
     log_timing_row(f_timing, iter, distinct_cells, mean_dist_to_true, stddev_x,
-                   stddev_y, ms_range_sensor, ess);
+                   stddev_y, ms_range_sensor, ess, distinct_triples);
     std::printf("[iter %d/%d] logged particles + timing rows\n", iter,
                 iters - 1);
     std::fflush(stdout);
