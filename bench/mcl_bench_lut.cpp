@@ -299,12 +299,12 @@ int main() {
     std::vector<float> angles_1080 = make_angles(1080);
 
     const std::vector<int> sweep_60 = {500, 1000, 2000, 4000, 8000, 11700, 16000, 24000, 32000, 50000, 75000, 100000};
-    const std::vector<int> sweep_1080 = {100, 300, 650, 1000, 2000};
+    // const std::vector<int> sweep_1080 = {100, 300, 650, 1000, 2000};
 
     std::printf("method,max_particles,num_rays,iters_per_sec,ms_total,ms_resample,ms_motion,ms_range_sensor,ms_normalize\n");
 
     run_sweep("glt", glt, map, sweep_60, angles_60, rng);
-    run_sweep("glt", glt, map, sweep_1080, angles_1080, rng);
+    // run_sweep("glt", glt, map, sweep_1080, angles_1080, rng);
 
     return 0;
 }

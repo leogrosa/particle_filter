@@ -923,6 +923,13 @@ int main(int argc, char **argv) {
                 iters - 1);
     std::fflush(stdout);
 
+    // // Redrawing particles, just for scenario 2 testing
+    // std::printf("[setup] sampling %d initial free-space particles\n",
+    //             max_particles);
+    // std::fflush(stdout);
+    // sample_free_particles(free_cells, particles, max_particles, rng);
+    // continue;
+
     // Skip resampling (and, since roughening exists only to counteract
     // resampling's own sample impoverishment, roughening too) when ESS is
     // still above threshold -- weights aren't informative enough yet to be
