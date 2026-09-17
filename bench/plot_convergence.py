@@ -9,7 +9,9 @@ Renders two static figures from the CSVs produced by `mcl_convergence --out-pref
                              of iterations (first / ~25% / ~50% / ~75% / last, adapted
                              to however many iterations are actually present), colored
                              by weight, with the ground-truth pose marked. Read from
-                             DIR/particles.csv + DIR/trajectory.csv.
+                             DIR/particles.csv + DIR/trajectory.csv. Skipped (with a
+                             notice, not an error) when particles.csv doesn't exist --
+                             e.g. a run made with mcl_convergence's --disable-particles-log.
 
 `<base>` is --output if given, else --out-prefix -- so by default this produces exactly
 <out-prefix>/convergence.png and <out-prefix>/snapshots.png, alongside the CSVs.
@@ -218,7 +220,6 @@ def main():
         sys.exit("error: one of --out-prefix or --recent/-r is required")
 
     timing_csv = require_csv(f"{out_prefix}/timing.csv")
-    particles_csv = require_csv(f"{out_prefix}/particles.csv")
     trajectory_csv = require_csv(f"{out_prefix}/trajectory.csv")
 
     base = args.output or out_prefix
@@ -227,8 +228,13 @@ def main():
     convergence_out = plot_convergence_panel(timing_csv, f"{base}/convergence.png", tag)
     print(f"wrote {convergence_out}")
 
-    snapshots_out = plot_snapshots_panel(particles_csv, trajectory_csv, f"{base}/snapshots.png", tag)
-    print(f"wrote {snapshots_out}")
+    particles_path = f"{out_prefix}/particles.csv"
+    if os.path.exists(particles_path):
+        snapshots_out = plot_snapshots_panel(particles_path, trajectory_csv, f"{base}/snapshots.png", tag)
+        print(f"wrote {snapshots_out}")
+    else:
+        print(f"note: {particles_path} not found (run made with --disable-particles-log?) "
+              "-- skipping snapshots.png")
 
 
 if __name__ == "__main__":

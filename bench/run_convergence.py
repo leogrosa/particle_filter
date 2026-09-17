@@ -13,7 +13,8 @@ Binary contract (see mcl_convergence.cpp / bench/build_convergence.sh, built in 
 this same contract):
     mcl_convergence --particles N --rays N --iters N --seed N --out-prefix DIR [--trajectory PATH]
 --out-prefix DIR is an output directory (created if missing, by both the binary itself and this
-script) holding DIR/timing.csv, DIR/particles.csv, DIR/trajectory.csv. If --trajectory is omitted,
+script) holding DIR/timing.csv, DIR/particles.csv, DIR/trajectory.csv (particles.csv is skipped
+entirely when --disable-particles-log is passed). If --trajectory is omitted,
 the binary auto-generates its own stand-still ground-truth trajectory (one free-space pose sampled
 from its own map + --seed) and still writes DIR/trajectory.csv -- this script never needs to
 generate or touch a trajectory file itself. --trajectory is plumbed through here purely so a
@@ -112,7 +113,7 @@ def _poll_timing_progress(timing_path, iters, stop_event):
 def run_binary(particles, rays, iters, seed, out_prefix, trajectory, dt, squash_factor,
                roughening_k, ess_resampling_threshold, init_mode, init_std_xy, init_std_theta,
                disable_measurement_update, motion_dispersion_x, motion_dispersion_y,
-               motion_dispersion_theta):
+               motion_dispersion_theta, disable_particles_log):
     cmd = [
         str(BINARY),
         "--particles", str(particles),
@@ -131,6 +132,7 @@ def run_binary(particles, rays, iters, seed, out_prefix, trajectory, dt, squash_
         "--motion-dispersion-x", str(motion_dispersion_x),
         "--motion-dispersion-y", str(motion_dispersion_y),
         "--motion-dispersion-theta", str(motion_dispersion_theta),
+        "--disable-particles-log", "1" if disable_particles_log else "0",
     ]
     if trajectory is not None:
         cmd += ["--trajectory", str(trajectory)]
@@ -243,6 +245,12 @@ def main():
                      help="optional path to a ground-truth trajectory CSV, forwarded to the binary "
                           "as --trajectory. Unused today (the binary auto-generates a stand-still "
                           "trajectory when omitted); plumbed through for a future phase.")
+    ap.add_argument("--disable-particles-log", action="store_true",
+                     help="forwarded to the binary's own --disable-particles-log: particles.csv "
+                          "is never opened/written at all (not just left empty), saving disk "
+                          "space on storage-constrained targets. timing.csv/trajectory.csv are "
+                          "unaffected, so convergence.png still plots -- only snapshots.png "
+                          "(plot_convergence.py) is unavailable afterward.")
     args = ap.parse_args()
 
     if args.time is not None and args.iters is not None:
@@ -267,7 +275,8 @@ def main():
         f"ess_resampling_threshold={args.ess_resampling_threshold} init_mode={args.init_mode} "
         f"disable_measurement_update={args.disable_measurement_update} "
         f"motion_dispersion_x={args.motion_dispersion_x} motion_dispersion_y={args.motion_dispersion_y} "
-        f"motion_dispersion_theta={args.motion_dispersion_theta} out_prefix={out_prefix}"
+        f"motion_dispersion_theta={args.motion_dispersion_theta} "
+        f"disable_particles_log={args.disable_particles_log} out_prefix={out_prefix}"
     )
     if args.init_mode == "tracking":
         logger.info(
@@ -281,14 +290,17 @@ def main():
                args.squash_factor, args.roughening_k, args.ess_resampling_threshold,
                args.init_mode, args.init_std_xy, args.init_std_theta,
                args.disable_measurement_update, args.motion_dispersion_x,
-               args.motion_dispersion_y, args.motion_dispersion_theta)
+               args.motion_dispersion_y, args.motion_dispersion_theta,
+               args.disable_particles_log)
 
     timing_csv = out_prefix / "timing.csv"
-    particles_csv = out_prefix / "particles.csv"
     trajectory_csv = out_prefix / "trajectory.csv"
     logger.info("==> Done. Output CSVs:")
     logger.info(f"    timing:     {timing_csv}")
-    logger.info(f"    particles:  {particles_csv}")
+    if args.disable_particles_log:
+        logger.info("    particles:  (skipped -- --disable-particles-log)")
+    else:
+        logger.info(f"    particles:  {out_prefix / 'particles.csv'}")
     logger.info(f"    trajectory: {trajectory_csv}")
 
 

@@ -637,6 +637,12 @@ static void print_usage(const char *prog) {
       "self-skip too) --\n"
       "                isolates the motion model alone, no sensor feedback, "
       "for debugging.\n"
+      "  --disable-particles-log  optional: 0 (default) or 1. When 1, "
+      "particles.csv is\n"
+      "                never opened/written at all (not just left empty) -- "
+      "saves disk space\n"
+      "                on storage-constrained targets. timing.csv/"
+      "trajectory.csv are unaffected.\n"
       "\n"
       "Runs GiantLUTCast's real MCL hot path (see mcl_bench_lut.cpp) for "
       "--iters iterations,\n"
@@ -669,6 +675,7 @@ int main(int argc, char **argv) {
   float init_std_xy_m = 0.5f;
   float init_std_theta = 0.4f;
   bool disable_measurement_update = false;
+  bool disable_particles_log = false;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -721,6 +728,8 @@ int main(int argc, char **argv) {
       init_std_theta = std::atof(value);
     else if (arg == "--disable-measurement-update")
       disable_measurement_update = std::atoi(value) != 0;
+    else if (arg == "--disable-particles-log")
+      disable_particles_log = std::atoi(value) != 0;
     else {
       std::fprintf(stderr, "unknown argument: %s\n", arg.c_str());
       print_usage(argv[0]);
@@ -872,9 +881,14 @@ int main(int argc, char **argv) {
   std::string trajectory_out_path = out_prefix + "/trajectory.csv";
 
   FILE *f_timing = std::fopen(timing_path.c_str(), "w");
-  FILE *f_particles = std::fopen(particles_path.c_str(), "w");
+  // particles.csv is skipped entirely (never opened) under --disable-particles-log
+  // rather than opened-and-left-empty, so the file genuinely doesn't exist on disk --
+  // this is a storage-constrained-target option (see print_usage above), not just a
+  // "don't bother logging" toggle.
+  FILE *f_particles =
+      disable_particles_log ? nullptr : std::fopen(particles_path.c_str(), "w");
   FILE *f_trajectory = std::fopen(trajectory_out_path.c_str(), "w");
-  if (!f_timing || !f_particles || !f_trajectory) {
+  if (!f_timing || (!disable_particles_log && !f_particles) || !f_trajectory) {
     std::fprintf(stderr, "failed to open output files at prefix: %s\n",
                  out_prefix.c_str());
     return 1;
@@ -882,7 +896,8 @@ int main(int argc, char **argv) {
 
   std::fprintf(f_timing, "iter,distinct_cells,mean_dist_to_true,stddev_x,"
                          "stddev_y,ms_range_sensor,ess,distinct_triples\n");
-  std::fprintf(f_particles, "iter,particle_id,x,y,theta,weight\n");
+  if (f_particles)
+    std::fprintf(f_particles, "iter,particle_id,x,y,theta,weight\n");
   std::fprintf(f_trajectory, "iter,t,x,y,theta,vx,vy\n");
 
   std::printf("[run] starting %d iterations (%d particles, %d rays)\n", iters,
@@ -954,7 +969,8 @@ int main(int argc, char **argv) {
                 max_particles);
     std::fflush(stdout);
 
-    log_particles(f_particles, iter, particles, weights, max_particles);
+    if (f_particles)
+      log_particles(f_particles, iter, particles, weights, max_particles);
     log_timing_row(f_timing, iter, distinct_cells, mean_dist_to_true, stddev_x,
                    stddev_y, ms_range_sensor, ess, distinct_triples);
     std::printf("[iter %d/%d] logged particles + timing rows\n", iter,
@@ -998,7 +1014,8 @@ int main(int argc, char **argv) {
   std::fflush(stdout);
 
   std::fclose(f_timing);
-  std::fclose(f_particles);
+  if (f_particles)
+    std::fclose(f_particles);
   std::fclose(f_trajectory);
 
   return 0;
