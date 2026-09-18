@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -17,6 +18,27 @@ using Clock = std::chrono::steady_clock;
 
 #define Q(x) #x
 #define QUOTE(x) Q(x)
+
+// Gates log_iter() below -- main()'s per-iteration loop sets this once per
+// iteration (verbose || iter % 100 == 0) before doing any work, so every
+// hot-path log call site just calls log_iter(...) instead of repeating its
+// own "if (do_log) { printf(...); fflush(stdout); }" boilerplate. Defaults
+// true so any log_iter call made outside the loop (there currently are none)
+// still prints rather than silently doing nothing.
+static bool g_log_this_iter = true;
+
+// printf-style logging for per-iteration hot-path messages: only actually
+// prints (and flushes stdout, so output stays visible under a hung/killed
+// run) when g_log_this_iter is true.
+static void log_iter(const char *fmt, ...) {
+  if (!g_log_this_iter)
+    return;
+  va_list args;
+  va_start(args, fmt);
+  std::vprintf(fmt, args);
+  va_end(args);
+  std::fflush(stdout);
+}
 
 // Does particle-filter convergence shrink the memory working set touched by
 // GiantLUTCast's giant_lut[(int)x][(int)y][theta_bin] lookups (RangeLib.h
@@ -643,6 +665,22 @@ static void print_usage(const char *prog) {
       "saves disk space\n"
       "                on storage-constrained targets. timing.csv/"
       "trajectory.csv are unaffected.\n"
+      "  --avg         optional flag (no value). When set, per-iteration "
+      "measurement-update\n"
+      "                timing is accumulated instead of printed every "
+      "iteration, and a\n"
+      "                single average-timings table is printed to stdout "
+      "after the run\n"
+      "                completes. timing.csv logging is unaffected.\n"
+      "  --verbose     optional flag (no value). When set, the hot-path "
+      "console log lines\n"
+      "                ([iter ...] motion/stats/observation/update/ess/"
+      "resample) print\n"
+      "                every iteration. Without it (default), those lines "
+      "only print every\n"
+      "                100th iteration (iter %% 100 == 0). timing.csv/"
+      "particles.csv logging\n"
+      "                is unaffected either way.\n"
       "\n"
       "Runs GiantLUTCast's real MCL hot path (see mcl_bench_lut.cpp) for "
       "--iters iterations,\n"
@@ -676,12 +714,22 @@ int main(int argc, char **argv) {
   float init_std_theta = 0.4f;
   bool disable_measurement_update = false;
   bool disable_particles_log = false;
+  bool avg_mode = false;
+  bool verbose = false;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
     if (arg == "-h" || arg == "--help") {
       print_usage(argv[0]);
       return 0;
+    }
+    if (arg == "--avg") {
+      avg_mode = true;
+      continue;
+    }
+    if (arg == "--verbose") {
+      verbose = true;
+      continue;
     }
     if (i + 1 >= argc) {
       std::fprintf(stderr, "%s requires a value\n", arg.c_str());
@@ -904,7 +952,10 @@ int main(int argc, char **argv) {
               max_particles, num_rays);
   std::fflush(stdout);
 
+  double sum_ms_range_sensor = 0.0;
+
   for (int iter = 0; iter < iters; ++iter) {
+    g_log_this_iter = verbose || (iter % 100 == 0);
     const Pose &gt = trajectory[iter];
     log_trajectory_row(f_trajectory, iter, gt);
 
@@ -912,10 +963,9 @@ int main(int argc, char **argv) {
         (iter == 0)
             ? 0.0f
             : wrap_angle(trajectory[iter].theta - trajectory[iter - 1].theta);
-    std::printf("[iter %d/%d] motion: applying process noise to %d particles "
-                "(true_delta_theta=%.4f)\n",
-                iter, iters - 1, max_particles, true_delta_theta);
-    std::fflush(stdout);
+    log_iter("[iter %d/%d] motion: applying process noise to %d particles "
+             "(true_delta_theta=%.4f)\n",
+             iter, iters - 1, max_particles, true_delta_theta);
     motion_step(particles, max_particles, rng, dt_seconds, nominal_velocity,
                 true_delta_theta, noise_v, noise_x, noise_y, noise_theta);
 
@@ -923,59 +973,53 @@ int main(int argc, char **argv) {
     double mean_dist_to_true, stddev_x, stddev_y;
     compute_working_set_stats(particles, max_particles, gt, distinct_cells,
                               mean_dist_to_true, stddev_x, stddev_y);
-    std::printf("[iter %d/%d] stats: distinct_cells=%ld mean_dist_to_true=%.3f "
-                "stddev_x=%.3f stddev_y=%.3f\n",
-                iter, iters - 1, distinct_cells, mean_dist_to_true, stddev_x,
-                stddev_y);
-    std::fflush(stdout);
+    log_iter("[iter %d/%d] stats: distinct_cells=%ld mean_dist_to_true=%.3f "
+             "stddev_x=%.3f stddev_y=%.3f\n",
+             iter, iters - 1, distinct_cells, mean_dist_to_true, stddev_x,
+             stddev_y);
 
     build_ground_truth_observation(glt, gt, angles, obs, num_rays);
-    std::printf("[iter %d/%d] observation: cast %d ground-truth rays\n", iter,
-                iters - 1, num_rays);
-    std::fflush(stdout);
+    log_iter("[iter %d/%d] observation: cast %d ground-truth rays\n", iter,
+             iters - 1, num_rays);
 
     double ms_range_sensor = 0.0;
     long distinct_triples = 0;
     if (disable_measurement_update) {
       for (int i = 0; i < max_particles; ++i)
         weights[i] = 1.0 / max_particles;
-      std::printf("[iter %d/%d] measurement update disabled -- weights set "
-                  "uniform\n",
-                  iter, iters - 1);
-      std::fflush(stdout);
+      log_iter("[iter %d/%d] measurement update disabled -- weights set "
+               "uniform\n",
+               iter, iters - 1);
     } else {
       ms_range_sensor =
           measurement_update(glt, sensor_table, table_width, particles, angles,
                              obs, new_weights, max_particles, num_rays,
                              distinct_triples);
-      std::printf("[iter %d/%d] measurement update: %.3f ms (distinct_triples=%ld)\n",
-                  iter, iters - 1, ms_range_sensor, distinct_triples);
-      std::fflush(stdout);
+      if (!avg_mode)
+        log_iter("[iter %d/%d] measurement update: %.3f ms (distinct_triples=%ld)\n",
+                 iter, iters - 1, ms_range_sensor, distinct_triples);
 
       squash_weights(new_weights, max_particles, squash_factor);
-      std::printf("[iter %d/%d] squashed weights (squash_factor=%.3f)\n", iter,
-                  iters - 1, squash_factor);
-      std::fflush(stdout);
+      log_iter("[iter %d/%d] squashed weights (squash_factor=%.3f)\n", iter,
+               iters - 1, squash_factor);
 
       normalize_weights(new_weights, weights, max_particles);
-      std::printf("[iter %d/%d] normalized weights\n", iter, iters - 1);
-      std::fflush(stdout);
+      log_iter("[iter %d/%d] normalized weights\n", iter, iters - 1);
     }
+    sum_ms_range_sensor += ms_range_sensor;
 
     double ess = compute_ess(weights, max_particles);
-    std::printf("[iter %d/%d] effective sample size: ESS=%.1f (%.1f%% of %d "
-                "particles)\n",
-                iter, iters - 1, ess, 100.0 * ess / max_particles,
-                max_particles);
-    std::fflush(stdout);
+    log_iter("[iter %d/%d] effective sample size: ESS=%.1f (%.1f%% of %d "
+             "particles)\n",
+             iter, iters - 1, ess, 100.0 * ess / max_particles,
+             max_particles);
 
     if (f_particles)
       log_particles(f_particles, iter, particles, weights, max_particles);
     log_timing_row(f_timing, iter, distinct_cells, mean_dist_to_true, stddev_x,
                    stddev_y, ms_range_sensor, ess, distinct_triples);
-    std::printf("[iter %d/%d] logged particles + timing rows\n", iter,
-                iters - 1);
-    std::fflush(stdout);
+    log_iter("[iter %d/%d] logged particles + timing rows\n", iter,
+             iters - 1);
 
     // // Redrawing particles, just for scenario 2 testing
     // std::printf("[setup] sampling %d initial free-space particles\n",
@@ -991,27 +1035,35 @@ int main(int argc, char **argv) {
     // when we're actually going to use its output, so proposal/
     // proposal_indices are never stale when swapped in below.
     if (ess > ess_resampling_threshold * max_particles) {
-      std::printf("[iter %d/%d] ESS=%.1f above threshold (%.1f%% of %d) -- "
-                  "skipping resample\n",
-                  iter, iters - 1, ess, 100.0 * ess_resampling_threshold,
-                  max_particles);
+      log_iter("[iter %d/%d] ESS=%.1f above threshold (%.1f%% of %d) -- "
+               "skipping resample\n",
+               iter, iters - 1, ess, 100.0 * ess_resampling_threshold,
+               max_particles);
     } else {
       resample_step(particles, weights, proposal, proposal_indices,
                     max_particles, rng);
       particles.swap(proposal);
-      std::printf(
+      log_iter(
           "[iter %d/%d] resample: drew %d particles for the next iteration\n",
           iter, iters - 1, max_particles);
 
       roughen_step(particles, max_particles, roughening_k, rng);
-      std::printf("[iter %d/%d] roughened resampled particles (K=%.3f)\n", iter,
-                  iters - 1, roughening_k);
+      log_iter("[iter %d/%d] roughened resampled particles (K=%.3f)\n", iter,
+               iters - 1, roughening_k);
     }
-    std::fflush(stdout);
   }
 
   std::printf("[run] done, closing output files\n");
   std::fflush(stdout);
+
+  if (avg_mode) {
+    std::printf("\n=== average timings over %d iterations ===\n", iters);
+    std::printf("%-24s %12s\n", "step", "avg_ms");
+    std::printf("%-24s %12.4f\n", "measurement_update",
+                sum_ms_range_sensor / iters);
+    std::printf("============================================\n");
+    std::fflush(stdout);
+  }
 
   std::fclose(f_timing);
   if (f_particles)
