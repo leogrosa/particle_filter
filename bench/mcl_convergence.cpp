@@ -966,6 +966,8 @@ int main(int argc, char **argv) {
   double sum_ms_ess = 0.0;
   double sum_ms_resample = 0.0;
   double sum_ms_total = 0.0;
+  long long sum_distinct_cells = 0;
+  long long sum_distinct_triples = 0;
   int avg_count = 0;
 
   for (int iter = 0; iter < iters; ++iter) {
@@ -1099,6 +1101,8 @@ int main(int argc, char **argv) {
       sum_ms_ess += ms_ess;
       sum_ms_resample += ms_resample;
       sum_ms_total += ms_total;
+      sum_distinct_cells += distinct_cells;
+      sum_distinct_triples += distinct_triples;
       ++avg_count;
     }
   }
@@ -1125,6 +1129,12 @@ int main(int argc, char **argv) {
       std::printf("--------------------------------------------\n");
       std::printf("%-24s %12.4f\n", "total (sum of steps)",
                   sum_ms_total / avg_count);
+      std::printf("============================================\n");
+      std::printf("%-24s %12s\n", "working set", "avg_count");
+      std::printf("%-24s %12.2f\n", "distinct_cells",
+                  (double)sum_distinct_cells / avg_count);
+      std::printf("%-24s %12.2f\n", "distinct_triples",
+                  (double)sum_distinct_triples / avg_count);
       std::printf("============================================\n");
     }
     std::fflush(stdout);
