@@ -681,6 +681,14 @@ static void print_usage(const char *prog) {
       "                100th iteration (iter %% 100 == 0). timing.csv/"
       "particles.csv logging\n"
       "                is unaffected either way.\n"
+      "  --redraw-every-iter  optional flag (no value). Scenario II: "
+      "replaces resample+\n"
+      "                roughening entirely with a fresh uniform free-space "
+      "particle draw every\n"
+      "                iteration (ignores --ess-resampling-threshold) -- "
+      "the maximally-\n"
+      "                decorrelated control, zero iteration-to-iteration "
+      "particle overlap.\n"
       "\n"
       "Runs GiantLUTCast's real MCL hot path (see mcl_bench_lut.cpp) for "
       "--iters iterations,\n"
@@ -716,6 +724,7 @@ int main(int argc, char **argv) {
   bool disable_particles_log = false;
   bool avg_mode = false;
   bool verbose = false;
+  bool redraw_every_iter = false;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -729,6 +738,10 @@ int main(int argc, char **argv) {
     }
     if (arg == "--verbose") {
       verbose = true;
+      continue;
+    }
+    if (arg == "--redraw-every-iter") {
+      redraw_every_iter = true;
       continue;
     }
     if (i + 1 >= argc) {
@@ -1054,21 +1067,31 @@ int main(int argc, char **argv) {
     log_iter("[iter %d/%d] logged particles + timing rows\n", iter,
              iters - 1);
 
-    // // Redrawing particles, just for scenario 2 testing
-    // std::printf("[setup] sampling %d initial free-space particles\n",
-    //             max_particles);
-    // std::fflush(stdout);
-    // sample_free_particles(free_cells, particles, max_particles, rng);
-    // continue;
-
     // Skip resampling (and, since roughening exists only to counteract
     // resampling's own sample impoverishment, roughening too) when ESS is
     // still above threshold -- weights aren't informative enough yet to be
     // worth redistributing mass over. resample_step is only ever called
     // when we're actually going to use its output, so proposal/
     // proposal_indices are never stale when swapped in below.
+    //
+    // --redraw-every-iter (Scenario II, see project notes 2026-09-17):
+    // replaces resample+roughen entirely with a fresh uniform free-space
+    // draw, unconditionally (ignores the ESS threshold) -- the
+    // maximally-decorrelated control, zero iteration-to-iteration particle
+    // overlap, as opposed to Scenario I (--ess-resampling-threshold set
+    // high enough to always skip resampling, population drifts but never
+    // reshuffles).
     double ms_resample = 0.0;
-    if (ess > ess_resampling_threshold * max_particles) {
+    if (redraw_every_iter) {
+      auto t_redraw0 = Clock::now();
+      sample_free_particles(free_cells, particles, max_particles, rng);
+      ms_resample = std::chrono::duration<double, std::milli>(
+                        Clock::now() - t_redraw0)
+                        .count();
+      log_iter("[iter %d/%d] redraw: sampled %d fresh free-space particles "
+               "(scenario II)\n",
+               iter, iters - 1, max_particles);
+    } else if (ess > ess_resampling_threshold * max_particles) {
       log_iter("[iter %d/%d] ESS=%.1f above threshold (%.1f%% of %d) -- "
                "skipping resample\n",
                iter, iters - 1, ess, 100.0 * ess_resampling_threshold,
