@@ -268,8 +268,18 @@ static void motion_step(std::vector<float> &particles, int n, std::mt19937 &rng,
 // pre-lookup) population -- the whole point of this tool: does convergence
 // shrink the set of giant_lut rows about to be touched by the timed
 // measurement_update() call?
+//
+// track_distinct_cells gates the unordered_set build below (2026-09-18,
+// --disable-working-set-stats): a perf run measures the WHOLE binary, not
+// just the timed regions, and this set's own insert/allocate traffic is
+// itself real memory-system cost that has nothing to do with giant_lut's
+// access pattern -- it would pollute a cache-miss-counter reading. mean/
+// stddev/mean_dist_to_true stay cheap, unconditional (plain arithmetic, no
+// hash set) since they don't have this problem. distinct_cells is set to -1
+// (a "not computed" sentinel, never a real count) when disabled.
 static void compute_working_set_stats(const std::vector<float> &particles,
                                       int n, const Pose &gt,
+                                      bool track_distinct_cells,
                                       long &distinct_cells,
                                       double &mean_dist_to_true,
                                       double &stddev_x, double &stddev_y) {
@@ -277,8 +287,10 @@ static void compute_working_set_stats(const std::vector<float> &particles,
   double sum_x = 0.0, sum_y = 0.0, sum_dist = 0.0;
   for (int i = 0; i < n; ++i) {
     float x = particles[i * 3 + 0], y = particles[i * 3 + 1];
-    int ix = (int)x, iy = (int)y;
-    distinct_cell_set.insert(((long long)ix << 32) | (unsigned int)iy);
+    if (track_distinct_cells) {
+      int ix = (int)x, iy = (int)y;
+      distinct_cell_set.insert(((long long)ix << 32) | (unsigned int)iy);
+    }
     sum_x += x;
     sum_y += y;
     double dx = (double)x - gt.x, dy = (double)y - gt.y;
@@ -298,7 +310,7 @@ static void compute_working_set_stats(const std::vector<float> &particles,
   var_y /= n;
   stddev_x = std::sqrt(var_x);
   stddev_y = std::sqrt(var_y);
-  distinct_cells = (long)distinct_cell_set.size();
+  distinct_cells = track_distinct_cells ? (long)distinct_cell_set.size() : -1;
 }
 
 // Step: this iteration's synthetic observation, ray-cast from the ground-truth
@@ -392,8 +404,19 @@ measurement_update(GiantLUTCast &glt, const std::vector<double> &sensor_table,
                    int table_width, std::vector<float> &particles,
                    std::vector<float> &angles, std::vector<float> &obs,
                    std::vector<double> &new_weights, int n, int num_rays,
-                   long &distinct_triples) {
-  distinct_triples = compute_distinct_triples(glt, particles, angles, n, num_rays);
+                   bool track_distinct_triples, long &distinct_triples) {
+  // track_distinct_triples gates compute_distinct_triples entirely -- see
+  // the comment on compute_working_set_stats above. This one matters far
+  // more: its unordered_set can hold up to n*num_rays entries (vs.
+  // distinct_cells' n), and in a scattered population nearly every insert
+  // is a genuinely new key (a fresh heap allocation), not a cheap duplicate
+  // lookup -- exactly the kind of allocator/cache traffic that would
+  // swamp a perf cache-miss reading of the REAL giant_lut access pattern
+  // below. -1 sentinel when disabled, same convention as distinct_cells.
+  distinct_triples = track_distinct_triples
+                          ? compute_distinct_triples(glt, particles, angles,
+                                                     n, num_rays)
+                          : -1;
 
   auto t0 = Clock::now();
   for (int i = 0; i < n; ++i) {
@@ -689,6 +712,23 @@ static void print_usage(const char *prog) {
       "the maximally-\n"
       "                decorrelated control, zero iteration-to-iteration "
       "particle overlap.\n"
+      "  --disable-working-set-stats  optional flag (no value). Skips "
+      "building the\n"
+      "                distinct_cells/distinct_triples unordered_set "
+      "diagnostics entirely --\n"
+      "                use this for any run you're wrapping in `perf "
+      "stat`: those sets do\n"
+      "                real allocator/cache traffic of their own (up to "
+      "particles*rays heap\n"
+      "                allocations per iteration) that has nothing to do "
+      "with giant_lut's\n"
+      "                access pattern, and would pollute a cache-miss-"
+      "counter reading. Logs\n"
+      "                -1 (not computed) for both fields in timing.csv "
+      "and skips the working\n"
+      "                set section of the --avg table. mean_dist_to_true/"
+      "stddev_x/stddev_y\n"
+      "                are unaffected (plain arithmetic, no hash set).\n"
       "\n"
       "Runs GiantLUTCast's real MCL hot path (see mcl_bench_lut.cpp) for "
       "--iters iterations,\n"
@@ -725,6 +765,7 @@ int main(int argc, char **argv) {
   bool avg_mode = false;
   bool verbose = false;
   bool redraw_every_iter = false;
+  bool disable_working_set_stats = false;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -742,6 +783,10 @@ int main(int argc, char **argv) {
     }
     if (arg == "--redraw-every-iter") {
       redraw_every_iter = true;
+      continue;
+    }
+    if (arg == "--disable-working-set-stats") {
+      disable_working_set_stats = true;
       continue;
     }
     if (i + 1 >= argc) {
@@ -1004,7 +1049,8 @@ int main(int argc, char **argv) {
 
     long distinct_cells;
     double mean_dist_to_true, stddev_x, stddev_y;
-    compute_working_set_stats(particles, max_particles, gt, distinct_cells,
+    compute_working_set_stats(particles, max_particles, gt,
+                              !disable_working_set_stats, distinct_cells,
                               mean_dist_to_true, stddev_x, stddev_y);
     log_iter("[iter %d/%d] stats: distinct_cells=%ld mean_dist_to_true=%.3f "
              "stddev_x=%.3f stddev_y=%.3f\n",
@@ -1029,7 +1075,7 @@ int main(int argc, char **argv) {
       ms_range_sensor =
           measurement_update(glt, sensor_table, table_width, particles, angles,
                              obs, new_weights, max_particles, num_rays,
-                             distinct_triples);
+                             !disable_working_set_stats, distinct_triples);
       if (!avg_mode)
         log_iter("[iter %d/%d] measurement update: %.3f ms (distinct_triples=%ld)\n",
                  iter, iters - 1, ms_range_sensor, distinct_triples);
@@ -1124,8 +1170,10 @@ int main(int argc, char **argv) {
       sum_ms_ess += ms_ess;
       sum_ms_resample += ms_resample;
       sum_ms_total += ms_total;
-      sum_distinct_cells += distinct_cells;
-      sum_distinct_triples += distinct_triples;
+      if (!disable_working_set_stats) {
+        sum_distinct_cells += distinct_cells;
+        sum_distinct_triples += distinct_triples;
+      }
       ++avg_count;
     }
   }
@@ -1153,12 +1201,17 @@ int main(int argc, char **argv) {
       std::printf("%-24s %12.4f\n", "total (sum of steps)",
                   sum_ms_total / avg_count);
       std::printf("============================================\n");
-      std::printf("%-24s %12s\n", "working set", "avg_count");
-      std::printf("%-24s %12.2f\n", "distinct_cells",
-                  (double)sum_distinct_cells / avg_count);
-      std::printf("%-24s %12.2f\n", "distinct_triples",
-                  (double)sum_distinct_triples / avg_count);
-      std::printf("============================================\n");
+      if (disable_working_set_stats) {
+        std::printf("working set stats disabled "
+                    "(--disable-working-set-stats)\n");
+      } else {
+        std::printf("%-24s %12s\n", "working set", "avg_count");
+        std::printf("%-24s %12.2f\n", "distinct_cells",
+                    (double)sum_distinct_cells / avg_count);
+        std::printf("%-24s %12.2f\n", "distinct_triples",
+                    (double)sum_distinct_triples / avg_count);
+        std::printf("============================================\n");
+      }
     }
     std::fflush(stdout);
   }
