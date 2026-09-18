@@ -952,7 +952,21 @@ int main(int argc, char **argv) {
               max_particles, num_rays);
   std::fflush(stdout);
 
+  // Aggregate (--avg) accumulators -- one per real PF step, mirroring
+  // measurement_update's existing ms_range_sensor. iter 0 is excluded from
+  // all of these (see avg_count below): it's a known cold-start outlier
+  // (first-ever LUT touch, initial global-localization scatter) that isn't
+  // representative of steady-state per-iteration cost -- see the 2026-09-15
+  // Mac timing entries in the project memory (iter 0 ~50ms vs iter 2+
+  // steady-state ~1.6ms, same params).
+  double sum_ms_motion = 0.0;
   double sum_ms_range_sensor = 0.0;
+  double sum_ms_squash = 0.0;
+  double sum_ms_normalize = 0.0;
+  double sum_ms_ess = 0.0;
+  double sum_ms_resample = 0.0;
+  double sum_ms_total = 0.0;
+  int avg_count = 0;
 
   for (int iter = 0; iter < iters; ++iter) {
     g_log_this_iter = verbose || (iter % 100 == 0);
@@ -966,8 +980,12 @@ int main(int argc, char **argv) {
     log_iter("[iter %d/%d] motion: applying process noise to %d particles "
              "(true_delta_theta=%.4f)\n",
              iter, iters - 1, max_particles, true_delta_theta);
+    auto t_motion0 = Clock::now();
     motion_step(particles, max_particles, rng, dt_seconds, nominal_velocity,
                 true_delta_theta, noise_v, noise_x, noise_y, noise_theta);
+    double ms_motion =
+        std::chrono::duration<double, std::milli>(Clock::now() - t_motion0)
+            .count();
 
     long distinct_cells;
     double mean_dist_to_true, stddev_x, stddev_y;
@@ -983,6 +1001,8 @@ int main(int argc, char **argv) {
              iters - 1, num_rays);
 
     double ms_range_sensor = 0.0;
+    double ms_squash = 0.0;
+    double ms_normalize = 0.0;
     long distinct_triples = 0;
     if (disable_measurement_update) {
       for (int i = 0; i < max_particles; ++i)
@@ -999,16 +1019,27 @@ int main(int argc, char **argv) {
         log_iter("[iter %d/%d] measurement update: %.3f ms (distinct_triples=%ld)\n",
                  iter, iters - 1, ms_range_sensor, distinct_triples);
 
+      auto t_squash0 = Clock::now();
       squash_weights(new_weights, max_particles, squash_factor);
+      ms_squash =
+          std::chrono::duration<double, std::milli>(Clock::now() - t_squash0)
+              .count();
       log_iter("[iter %d/%d] squashed weights (squash_factor=%.3f)\n", iter,
                iters - 1, squash_factor);
 
+      auto t_normalize0 = Clock::now();
       normalize_weights(new_weights, weights, max_particles);
+      ms_normalize = std::chrono::duration<double, std::milli>(
+                         Clock::now() - t_normalize0)
+                         .count();
       log_iter("[iter %d/%d] normalized weights\n", iter, iters - 1);
     }
-    sum_ms_range_sensor += ms_range_sensor;
 
+    auto t_ess0 = Clock::now();
     double ess = compute_ess(weights, max_particles);
+    double ms_ess =
+        std::chrono::duration<double, std::milli>(Clock::now() - t_ess0)
+            .count();
     log_iter("[iter %d/%d] effective sample size: ESS=%.1f (%.1f%% of %d "
              "particles)\n",
              iter, iters - 1, ess, 100.0 * ess / max_particles,
@@ -1034,12 +1065,14 @@ int main(int argc, char **argv) {
     // worth redistributing mass over. resample_step is only ever called
     // when we're actually going to use its output, so proposal/
     // proposal_indices are never stale when swapped in below.
+    double ms_resample = 0.0;
     if (ess > ess_resampling_threshold * max_particles) {
       log_iter("[iter %d/%d] ESS=%.1f above threshold (%.1f%% of %d) -- "
                "skipping resample\n",
                iter, iters - 1, ess, 100.0 * ess_resampling_threshold,
                max_particles);
     } else {
+      auto t_resample0 = Clock::now();
       resample_step(particles, weights, proposal, proposal_indices,
                     max_particles, rng);
       particles.swap(proposal);
@@ -1048,8 +1081,25 @@ int main(int argc, char **argv) {
           iter, iters - 1, max_particles);
 
       roughen_step(particles, max_particles, roughening_k, rng);
+      ms_resample = std::chrono::duration<double, std::milli>(
+                        Clock::now() - t_resample0)
+                        .count();
       log_iter("[iter %d/%d] roughened resampled particles (K=%.3f)\n", iter,
                iters - 1, roughening_k);
+    }
+
+    // iter 0 excluded from the aggregate -- see the comment above sum_ms_motion.
+    if (iter > 0) {
+      double ms_total = ms_motion + ms_range_sensor + ms_squash +
+                        ms_normalize + ms_ess + ms_resample;
+      sum_ms_motion += ms_motion;
+      sum_ms_range_sensor += ms_range_sensor;
+      sum_ms_squash += ms_squash;
+      sum_ms_normalize += ms_normalize;
+      sum_ms_ess += ms_ess;
+      sum_ms_resample += ms_resample;
+      sum_ms_total += ms_total;
+      ++avg_count;
     }
   }
 
@@ -1057,11 +1107,26 @@ int main(int argc, char **argv) {
   std::fflush(stdout);
 
   if (avg_mode) {
-    std::printf("\n=== average timings over %d iterations ===\n", iters);
-    std::printf("%-24s %12s\n", "step", "avg_ms");
-    std::printf("%-24s %12.4f\n", "measurement_update",
-                sum_ms_range_sensor / iters);
-    std::printf("============================================\n");
+    if (avg_count == 0) {
+      std::printf("\n=== average timings: no iterations to average (iter 0 "
+                  "is always excluded -- need --iters >= 2) ===\n");
+    } else {
+      std::printf("\n=== average timings over %d iterations (iter 0 "
+                  "excluded) ===\n",
+                  avg_count);
+      std::printf("%-24s %12s\n", "step", "avg_ms");
+      std::printf("%-24s %12.4f\n", "motion", sum_ms_motion / avg_count);
+      std::printf("%-24s %12.4f\n", "measurement_update",
+                  sum_ms_range_sensor / avg_count);
+      std::printf("%-24s %12.4f\n", "squash", sum_ms_squash / avg_count);
+      std::printf("%-24s %12.4f\n", "normalize", sum_ms_normalize / avg_count);
+      std::printf("%-24s %12.4f\n", "ess", sum_ms_ess / avg_count);
+      std::printf("%-24s %12.4f\n", "resample", sum_ms_resample / avg_count);
+      std::printf("--------------------------------------------\n");
+      std::printf("%-24s %12.4f\n", "total (sum of steps)",
+                  sum_ms_total / avg_count);
+      std::printf("============================================\n");
+    }
     std::fflush(stdout);
   }
 
