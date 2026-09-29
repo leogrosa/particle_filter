@@ -20,6 +20,34 @@ using Clock = std::chrono::steady_clock;
 #define Q(x) #x
 #define QUOTE(x) Q(x)
 
+// Range method under test, fixed at compile time (one CMake target per method,
+// all built from this file): mcl_convergence (GLT, the default),
+// mcl_convergence_rm, mcl_convergence_rmgpu (WITH_CUDA only). MethodT is the
+// concrete class, so calls go straight to it -- same as the old hardcoded
+// GiantLUTCast &glt, no extra RangeMethod& indirection that would perturb the
+// GLT timings already collected.
+#define RANGE_METHOD_GLT 0
+#define RANGE_METHOD_RM 1
+#define RANGE_METHOD_RMGPU 2
+#ifndef RANGE_METHOD
+#define RANGE_METHOD RANGE_METHOD_GLT
+#endif
+#if RANGE_METHOD == RANGE_METHOD_GLT
+typedef GiantLUTCast MethodT;
+static const char *METHOD_NAME = "glt";
+#elif RANGE_METHOD == RANGE_METHOD_RM
+typedef RayMarching MethodT;
+static const char *METHOD_NAME = "rm";
+#elif RANGE_METHOD == RANGE_METHOD_RMGPU
+#if USE_CUDA != 1
+#error "RANGE_METHOD_RMGPU needs a CUDA build (USE_CUDA=1, see CMakeLists.txt)"
+#endif
+typedef RayMarchingGPU MethodT;
+static const char *METHOD_NAME = "rmgpu";
+#else
+#error "unknown RANGE_METHOD"
+#endif
+
 // Gates log_iter() below -- main()'s per-iteration loop sets this once per
 // iteration (verbose || iter % 100 == 0) before doing any work, so every
 // hot-path log call site just calls log_iter(...) instead of repeating its
@@ -343,12 +371,20 @@ static void compute_working_set_stats(const std::vector<float> &particles,
 // So: back to glt.calc_range() directly, per ray -- and (2026-08-18)
 // measurement_update() below now does the same, so obs and every particle's
 // predicted range are computed in the SAME correct, unswapped convention.
-static void build_ground_truth_observation(GiantLUTCast &glt, const Pose &gt,
+//
+// 2026-09-29: the observation now always comes from a CPU RayMarching,
+// whatever RANGE_METHOD is under test -- every method is scored against the
+// same (exact, unquantized) observation, and RayMarchingGPU can't cast single
+// rays anyway. Same pattern as mcl_bench_rmgpu.cpp's obs_source. Note this
+// changes GLT's own runs slightly vs. before (its LUT ranges are now compared
+// against exact RM ranges, not against its own quantized ones).
+static void build_ground_truth_observation(RayMarching &obs_caster,
+                                           const Pose &gt,
                                            std::vector<float> &angles,
                                            std::vector<float> &obs,
                                            int num_rays) {
   for (int a = 0; a < num_rays; ++a)
-    obs[a] = glt.calc_range(gt.x, gt.y, gt.theta + angles[a]);
+    obs[a] = obs_caster.calc_range(gt.x, gt.y, gt.theta + angles[a]);
 }
 
 // Step: update. The one timed region -- lookup + sensor-model eval against
@@ -380,6 +416,7 @@ static void build_ground_truth_observation(GiantLUTCast &glt, const Pose &gt,
 // replica (unlike the LUT_CLOCK_SPLIT experiment in mcl_bench_lut.cpp,
 // which had to reimplement it because it's called from a free function, not
 // a method with access to glt).
+#if RANGE_METHOD == RANGE_METHOD_GLT
 static long compute_distinct_triples(GiantLUTCast &glt,
                                      const std::vector<float> &particles,
                                      const std::vector<float> &angles, int n,
@@ -399,13 +436,15 @@ static long compute_distinct_triples(GiantLUTCast &glt,
   }
   return (long)triple_set.size();
 }
+#endif
 
 static double
-measurement_update(GiantLUTCast &glt, const std::vector<double> &sensor_table,
+measurement_update(MethodT &method, const std::vector<double> &sensor_table,
                    int table_width, std::vector<float> &particles,
                    std::vector<float> &angles, std::vector<float> &obs,
-                   std::vector<double> &new_weights, int n, int num_rays,
-                   bool track_distinct_triples, long &distinct_triples) {
+                   std::vector<double> &new_weights, std::vector<float> &ranges,
+                   int n, int num_rays, bool track_distinct_triples,
+                   long &distinct_triples) {
   // track_distinct_triples gates compute_distinct_triples entirely -- see
   // the comment on compute_working_set_stats above. This one matters far
   // more: its unordered_set can hold up to n*num_rays entries (vs.
@@ -414,19 +453,36 @@ measurement_update(GiantLUTCast &glt, const std::vector<double> &sensor_table,
   // lookup -- exactly the kind of allocator/cache traffic that would
   // swamp a perf cache-miss reading of the REAL giant_lut access pattern
   // below. -1 sentinel when disabled, same convention as distinct_cells.
+  // distinct_triples is GLT-only: the (x, y, theta_bin) key is the LUT's own
+  // indexing -- RM has no theta bins, so it's always -1 there.
+#if RANGE_METHOD == RANGE_METHOD_GLT
   distinct_triples = track_distinct_triples
-                          ? compute_distinct_triples(glt, particles, angles,
+                          ? compute_distinct_triples(method, particles, angles,
                                                      n, num_rays)
                           : -1;
+#else
+  (void)track_distinct_triples;
+  distinct_triples = -1;
+#endif
 
   auto t0 = Clock::now();
+#if RANGE_METHOD == RANGE_METHOD_RMGPU
+  // RayMarchingGPU is batched-only (its calc_range refuses single rays), so:
+  // cast every (particle, angle) pair into `ranges` first, then weight them
+  // in a separate CPU pass with the exact same sensor-table lookup as the CPU
+  // path below. Batches stay under CHUNK_SIZE so numpy_calc_range_angles
+  // never hits its own internal-split overflow -- see mcl_bench_rmgpu.cpp's
+  // safe_batch comment (a real cudaErrorInvalidValue at 8000 particles).
+  const int safe_batch = std::max(1, CHUNK_SIZE / num_rays);
+  for (int off = 0; off < n; off += safe_batch) {
+    int m = std::min(safe_batch, n - off);
+    method.numpy_calc_range_angles(&particles[off * 3], angles.data(),
+                                   &ranges[off * num_rays], m, num_rays);
+  }
   for (int i = 0; i < n; ++i) {
-    float px = particles[i * 3 + 0];
-    float py = particles[i * 3 + 1];
-    float ptheta = particles[i * 3 + 2];
     double weight = 1.0;
     for (int a = 0; a < num_rays; ++a) {
-      float d = glt.calc_range(px, py, ptheta + angles[a]);
+      float d = ranges[i * num_rays + a];
       float r = obs[a];
       r = std::min(std::max(r, 0.0f), (float)table_width - 1.0f);
       d = std::min(std::max(d, 0.0f), (float)table_width - 1.0f);
@@ -434,9 +490,69 @@ measurement_update(GiantLUTCast &glt, const std::vector<double> &sensor_table,
     }
     new_weights[i] = weight;
   }
+#else
+  (void)ranges; // CPU methods cast per ray, fused with weighting
+  for (int i = 0; i < n; ++i) {
+    float px = particles[i * 3 + 0];
+    float py = particles[i * 3 + 1];
+    float ptheta = particles[i * 3 + 2];
+    double weight = 1.0;
+    for (int a = 0; a < num_rays; ++a) {
+      float d = method.calc_range(px, py, ptheta + angles[a]);
+      float r = obs[a];
+      r = std::min(std::max(r, 0.0f), (float)table_width - 1.0f);
+      d = std::min(std::max(d, 0.0f), (float)table_width - 1.0f);
+      weight *= sensor_table[(int)r * table_width + (int)d];
+    }
+    new_weights[i] = weight;
+  }
+#endif
   auto t1 = Clock::now();
   return std::chrono::duration<double, std::milli>(t1 - t0).count();
 }
+
+#if RANGE_METHOD == RANGE_METHOD_RMGPU
+// One-time, untimed sanity check: RayMarchingGPU's batched path applies
+// RangeLib's ROS world->grid transform (theta negation + rotation offset +
+// x/y swap) -- the same transform that caused the 2026-08-18 x/y-swap bug on
+// the CPU side. Cast the initial population on both GPU and CPU RM and
+// compare, so a convention mismatch shows up here as a loud warning rather
+// than as silently wrong weights.
+static void rmgpu_parity_check(RayMarchingGPU &gpu, RayMarching &cpu,
+                               std::vector<float> &particles,
+                               std::vector<float> &angles, int n,
+                               int num_rays) {
+  std::vector<float> gpu_ranges((size_t)n * num_rays);
+  const int safe_batch = std::max(1, CHUNK_SIZE / num_rays);
+  for (int off = 0; off < n; off += safe_batch) {
+    int m = std::min(safe_batch, n - off);
+    gpu.numpy_calc_range_angles(&particles[off * 3], angles.data(),
+                                &gpu_ranges[off * num_rays], m, num_rays);
+  }
+  double max_diff = 0.0, sum_diff = 0.0;
+  long over_1px = 0;
+  for (int i = 0; i < n; ++i) {
+    for (int a = 0; a < num_rays; ++a) {
+      float c = cpu.calc_range(particles[i * 3 + 0], particles[i * 3 + 1],
+                               particles[i * 3 + 2] + angles[a]);
+      double diff = std::fabs((double)gpu_ranges[i * num_rays + a] - c);
+      max_diff = std::max(max_diff, diff);
+      sum_diff += diff;
+      if (diff > 1.0)
+        ++over_1px;
+    }
+  }
+  long total = (long)n * num_rays;
+  std::printf("[setup] rmgpu parity vs CPU RM over %ld rays: max|diff|=%.3fpx "
+              "mean|diff|=%.4fpx, %ld rays (%.2f%%) off by >1px\n",
+              total, max_diff, sum_diff / total, over_1px,
+              100.0 * over_1px / total);
+  if (over_1px > 0)
+    std::printf("[setup] WARNING: rmgpu disagrees with CPU RM -- check the "
+                "world->grid convention before trusting any rmgpu timing\n");
+  std::fflush(stdout);
+}
+#endif
 
 // Step: squash. The measurement update's raw weight is a product of
 // num_rays sub-1 terms, so raw weights can differ by hundreds of orders of
@@ -747,7 +863,10 @@ static void print_usage(const char *prog) {
       "stddev_x/stddev_y\n"
       "                are unaffected (plain arithmetic, no hash set).\n"
       "\n"
-      "Runs GiantLUTCast's real MCL hot path (see mcl_bench_lut.cpp) for "
+      "Range method is fixed at build time (mcl_convergence = GLT, "
+      "mcl_convergence_rm = RM,\n"
+      "mcl_convergence_rmgpu = RMGPU). "
+      "Runs that method's real MCL hot path for "
       "--iters iterations,\n"
       "logging every iteration individually -- not averaged like "
       "mcl_bench*.cpp's WARMUP+TIMED\n"
@@ -908,12 +1027,13 @@ int main(int argc, char **argv) {
     preset("--motion-dispersion-theta", motion_dispersion_theta, 0.0f);
   }
   std::printf(
-      "[setup] scenario=%s: init_mode=%s ess_resampling_threshold=%.3f "
+      "[setup] method=%s scenario=%s: init_mode=%s ess_resampling_threshold=%.3f "
       "roughening_k=%.3f nominal_velocity=%.3f velocity_noise_std=%.3f "
       "motion_dispersion_x=%.3f motion_dispersion_y=%.3f "
       "motion_dispersion_theta=%.3f squash_factor=%.3f dt=%.4f "
       "redraw_every_iter=%d disable_measurement_update=%d\n",
-      scenario.c_str(), init_mode.c_str(), ess_resampling_threshold,
+      METHOD_NAME, scenario.c_str(), init_mode.c_str(),
+      ess_resampling_threshold,
       roughening_k, nominal_velocity, velocity_noise_std, motion_dispersion_x,
       motion_dispersion_y, motion_dispersion_theta, squash_factor, dt_seconds,
       (int)redraw_every_iter, (int)disable_measurement_update);
@@ -955,17 +1075,25 @@ int main(int argc, char **argv) {
   std::printf("[setup] sensor model table built\n");
   std::fflush(stdout);
 
-  // GiantLUTCast's own init (building the full LUT) is slow -- a one-time cost
-  // paid here, not per-iteration, same pattern as mcl_bench_lut.cpp. This tool
-  // is LUT-only, not a multi-method sweep like mcl_bench.cpp: the whole point
-  // is GiantLUTCast's position-indexed lookup.
-  std::printf("[setup] building LUT (this is the slow one-time step)\n");
+  // Ground-truth observation caster: always CPU RayMarching, whatever method
+  // is under test (see build_ground_truth_observation).
+  RayMarching obs_caster(map, max_range_px);
+
+  // The method under test. GiantLUTCast's own init (building the full LUT) is
+  // slow -- a one-time cost paid here, not per-iteration, same pattern as
+  // mcl_bench_lut.cpp.
+  std::printf("[setup] building range method '%s'%s\n", METHOD_NAME,
+              RANGE_METHOD == RANGE_METHOD_GLT
+                  ? " (LUT: this is the slow one-time step)"
+                  : "");
   std::fflush(stdout);
-  GiantLUTCast glt(map, max_range_px, THETA_DISCRETIZATION);
-  std::printf("[setup] LUT built\n");
-  std::fflush(stdout);
-  glt.set_sensor_model(sensor_table.data(), table_width);
-  std::printf("[setup] sensor model attached to LUT caster\n");
+#if RANGE_METHOD == RANGE_METHOD_GLT
+  MethodT method(map, max_range_px, THETA_DISCRETIZATION);
+  method.set_sensor_model(sensor_table.data(), table_width);
+#else
+  MethodT method(map, max_range_px);
+#endif
+  std::printf("[setup] range method '%s' built\n", METHOD_NAME);
   std::fflush(stdout);
 
   std::mt19937 rng(seed);
@@ -1032,6 +1160,14 @@ int main(int argc, char **argv) {
   std::vector<double> new_weights(max_particles);
   std::vector<int> proposal_indices(max_particles);
   std::vector<float> obs(num_rays);
+  // Only used by the batched (GPU) path; CPU methods cast per ray.
+  std::vector<float> ranges(RANGE_METHOD == RANGE_METHOD_RMGPU
+                                ? (size_t)max_particles * num_rays
+                                : 0);
+#if RANGE_METHOD == RANGE_METHOD_RMGPU
+  rmgpu_parity_check(method, obs_caster, particles, angles, max_particles,
+                     num_rays);
+#endif
 
   std::normal_distribution<float> noise_x(0.0f,
                                           motion_dispersion_x / MAP_RESOLUTION);
@@ -1121,7 +1257,7 @@ int main(int argc, char **argv) {
              iter, iters - 1, distinct_cells, mean_dist_to_true, stddev_x,
              stddev_y);
 
-    build_ground_truth_observation(glt, gt, angles, obs, num_rays);
+    build_ground_truth_observation(obs_caster, gt, angles, obs, num_rays);
     log_iter("[iter %d/%d] observation: cast %d ground-truth rays\n", iter,
              iters - 1, num_rays);
 
@@ -1137,8 +1273,9 @@ int main(int argc, char **argv) {
                iter, iters - 1);
     } else {
       ms_range_sensor =
-          measurement_update(glt, sensor_table, table_width, particles, angles,
-                             obs, new_weights, max_particles, num_rays,
+          measurement_update(method, sensor_table, table_width, particles,
+                             angles, obs, new_weights, ranges, max_particles,
+                             num_rays,
                              !disable_working_set_stats, distinct_triples);
       if (!avg_mode)
         log_iter("[iter %d/%d] measurement update: %.3f ms (distinct_triples=%ld)\n",

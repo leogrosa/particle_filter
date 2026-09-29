@@ -49,6 +49,14 @@ add_executable(mcl_convergence mcl_convergence.cpp
     ${RANGE_LIBC_DIR}/vendor/lodepng/lodepng.cpp)
 target_link_libraries(mcl_convergence pthread)
 
+# Same source, range method fixed at compile time (RANGE_METHOD, see the top of
+# mcl_convergence.cpp): mcl_convergence above is GLT (the default), this one is
+# CPU RayMarching; the CUDA-only rmgpu variant is in the WITH_CUDA block below.
+add_executable(mcl_convergence_rm mcl_convergence.cpp
+    ${RANGE_LIBC_DIR}/vendor/lodepng/lodepng.cpp)
+target_compile_definitions(mcl_convergence_rm PRIVATE RANGE_METHOD=RANGE_METHOD_RM)
+target_link_libraries(mcl_convergence_rm pthread)
+
 # opt-in only: -g -O0 for mcl_convergence specifically, invoked from a separate build dir
 # (build_convergence_debug.sh) so the normal Release build above is untouched. Clang/GCC honor the
 # last -O flag on the command line, so appending -O0 after CMAKE_CXX_FLAGS' global -O3 wins.
@@ -92,4 +100,13 @@ if(WITH_CUDA)
 		${RANGE_LIBC_DIR}/vendor/lodepng/lodepng.cpp)
 	target_compile_definitions(mcl_bench_lutgpu PRIVATE USE_CUDA=1 CHUNK_SIZE=262144 NUM_THREADS=256)
 	target_link_libraries(mcl_bench_lutgpu pthread)
+
+	# mcl_convergence with RayMarchingGPU as the range method (see RANGE_METHOD in
+	# mcl_convergence.cpp). Same kernels.cu / -arch / CHUNK_SIZE / NUM_THREADS as above.
+	cuda_add_executable(mcl_convergence_rmgpu mcl_convergence.cpp
+		${RANGE_LIBC_DIR}/includes/kernels.cu
+		${RANGE_LIBC_DIR}/vendor/lodepng/lodepng.cpp)
+	target_compile_definitions(mcl_convergence_rmgpu PRIVATE RANGE_METHOD=RANGE_METHOD_RMGPU
+		USE_CUDA=1 CHUNK_SIZE=262144 NUM_THREADS=256)
+	target_link_libraries(mcl_convergence_rmgpu pthread)
 endif()

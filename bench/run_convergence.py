@@ -45,15 +45,20 @@ from loguru import logger
 
 BENCH_DIR = Path(__file__).resolve().parent
 BUILD_SCRIPT = BENCH_DIR / "build_convergence.sh"
-BINARY = BENCH_DIR / "build_convergence" / "bin" / "mcl_convergence"
+# Range method is fixed at compile time, one binary per method (see build_convergence.sh).
+BINARIES = {
+    "glt": BENCH_DIR / "build_convergence" / "bin" / "mcl_convergence",
+    "rm": BENCH_DIR / "build_convergence" / "bin" / "mcl_convergence_rm",
+    "rmgpu": BENCH_DIR / "build_convergence_cuda" / "bin" / "mcl_convergence_rmgpu",
+}
 DEFAULT_RESULTS_DIR = BENCH_DIR / "results"
 
 
-def build_binary():
-    logger.info(f"==> Ensuring {BINARY} is built (running {BUILD_SCRIPT})")
+def build_binary(method):
+    logger.info(f"==> Ensuring {BINARIES[method]} is built (running {BUILD_SCRIPT} {method})")
     try:
         result = subprocess.run(
-            [str(BUILD_SCRIPT)],
+            [str(BUILD_SCRIPT), method],
             cwd=BENCH_DIR,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -116,9 +121,9 @@ def _poll_timing_progress(timing_path, iters, stop_event):
                 next_threshold += progress_interval
 
 
-def run_binary(particles, rays, iters, seed, out_prefix, dt, passthrough):
+def run_binary(method, particles, rays, iters, seed, out_prefix, dt, passthrough):
     cmd = [
-        str(BINARY),
+        str(BINARIES[method]),
         "--particles", str(particles),
         "--rays", str(rays),
         "--iters", str(iters),
@@ -139,7 +144,7 @@ def run_binary(particles, rays, iters, seed, out_prefix, dt, passthrough):
             bufsize=1,
         )
     except FileNotFoundError:
-        logger.error(f"binary not found at {BINARY} -- build_convergence.sh should have produced it")
+        logger.error(f"binary not found at {BINARIES[method]} -- build_convergence.sh should have produced it")
         sys.exit(1)
 
     timing_path = Path(out_prefix) / "timing.csv"
@@ -162,6 +167,9 @@ def run_binary(particles, rays, iters, seed, out_prefix, dt, passthrough):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
                                  allow_abbrev=False)  # never swallow a forwarded binary flag by prefix
+    ap.add_argument("--method", choices=sorted(BINARIES), default="glt",
+                     help="range method, i.e. which compile-time variant to build and run "
+                          "(default glt). rmgpu needs CUDA (Jetson only).")
     ap.add_argument("--particles", type=int, default=2000, help="number of particles (default 2000)")
     ap.add_argument("--rays", type=int, default=60, help="number of LIDAR rays (default 60)")
     ap.add_argument("--iters", type=int, default=None,
@@ -201,14 +209,14 @@ def main():
     out_prefix.mkdir(parents=True, exist_ok=True)
 
     logger.info(
-        f"==> Config: particles={args.particles} rays={args.rays} iters={iters} "
+        f"==> Config: method={args.method} particles={args.particles} rays={args.rays} iters={iters} "
         f"seed={args.seed} dt={args.dt if args.dt is not None else '(binary default)'} "
         f"out_prefix={out_prefix}"
     )
     logger.info(f"==> Forwarded to binary as-is: {' '.join(passthrough) or '(nothing)'}")
 
-    build_binary()
-    run_binary(args.particles, args.rays, iters, args.seed, out_prefix, args.dt, passthrough)
+    build_binary(args.method)
+    run_binary(args.method, args.particles, args.rays, iters, args.seed, out_prefix, args.dt, passthrough)
 
     timing_csv = out_prefix / "timing.csv"
     trajectory_csv = out_prefix / "trajectory.csv"
