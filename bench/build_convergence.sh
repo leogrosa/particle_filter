@@ -29,6 +29,12 @@ if [ ! -f CMakeCache.txt ]; then
 	cmake -DWITH_CUDA="$WITH_CUDA" ..
 fi
 
+# A generated Makefile only re-runs cmake (on CMakeLists.txt changes) when asked for a target it
+# already knows -- so a target added since the last configure fails with "No rule to make target"
+# unless the configure check runs first. cmake_check_build_system is that check: a no-op when
+# nothing changed.
+make cmake_check_build_system
+
 echo "==> Building $TARGET"
 make "$TARGET"
 
