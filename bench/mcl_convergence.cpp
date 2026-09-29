@@ -438,6 +438,56 @@ static long compute_distinct_triples(GiantLUTCast &glt,
 }
 #endif
 
+#if RANGE_METHOD == RANGE_METHOD_RMGPU
+// Casts every (particle, angle) pair on the GPU into `ranges`, in the SAME
+// convention as CPU RayMarching::calc_range. Used by both measurement_update
+// and rmgpu_parity_check, so the parity check validates exactly the timed path.
+//
+// Why the input rewrite: RayMarchingGPU::numpy_calc_range_angles always runs
+// kernels.cu's ROS world->grid front-end (cuda_ray_marching_angles_world_to_grid,
+// ~kernels.cu:112): under our identity world transform it swaps (x, y) and
+// uses heading -theta - 3pi/2 - a, i.e. direction (sin(theta+a), cos(theta+a))
+// -- a correct ray, but marched over the TRANSPOSED map, since the distance
+// lookup is distMap[x*height+y] = grid[x][y], same layout as the CPU. Same x/y
+// swap as the 2026-08-18 CPU-side bug. Confirmed on the Jetson 2026-09-29:
+// 99.19% of 480k rays off by >1px, mean 72px
+// (results/parity_checks/2026-09-29_rmgpu_parity_jetson.txt).
+// Feeding (y, x, pi/2 - theta) with negated angles makes the kernel's own
+// transform land exactly on the CPU ray: position swaps back to (x, y), and
+// heading becomes theta + a - 2pi. Valid ONLY for the identity transform
+// (set_identity_ros_transform), which is all this tool uses. range_libc
+// itself is left untouched (the mit-racecar node depends on it).
+//
+// The rewrite (n*3 floats) runs inside measurement_update's timed region --
+// negligible next to n*num_rays ray marches, but it is in there.
+static void rmgpu_cast_all(RayMarchingGPU &gpu,
+                           const std::vector<float> &particles,
+                           const std::vector<float> &angles,
+                           std::vector<float> &ranges, int n, int num_rays) {
+  // single-threaded tool: reused scratch buffers, no per-call allocation
+  static std::vector<float> gpu_ins;
+  static std::vector<float> neg_angles;
+  gpu_ins.resize((size_t)n * 3);
+  neg_angles.resize(num_rays);
+  for (int a = 0; a < num_rays; ++a)
+    neg_angles[a] = -angles[a];
+  for (int i = 0; i < n; ++i) {
+    gpu_ins[i * 3 + 0] = particles[i * 3 + 1];
+    gpu_ins[i * 3 + 1] = particles[i * 3 + 0];
+    gpu_ins[i * 3 + 2] = (float)(M_PI / 2.0) - particles[i * 3 + 2];
+  }
+  // Batches stay under CHUNK_SIZE so numpy_calc_range_angles never hits its
+  // own internal-split overflow -- see mcl_bench_rmgpu.cpp's safe_batch
+  // comment (a real cudaErrorInvalidValue at 8000 particles).
+  const int safe_batch = std::max(1, CHUNK_SIZE / num_rays);
+  for (int off = 0; off < n; off += safe_batch) {
+    int m = std::min(safe_batch, n - off);
+    gpu.numpy_calc_range_angles(&gpu_ins[off * 3], neg_angles.data(),
+                                &ranges[off * num_rays], m, num_rays);
+  }
+}
+#endif
+
 static double
 measurement_update(MethodT &method, const std::vector<double> &sensor_table,
                    int table_width, std::vector<float> &particles,
@@ -470,15 +520,8 @@ measurement_update(MethodT &method, const std::vector<double> &sensor_table,
   // RayMarchingGPU is batched-only (its calc_range refuses single rays), so:
   // cast every (particle, angle) pair into `ranges` first, then weight them
   // in a separate CPU pass with the exact same sensor-table lookup as the CPU
-  // path below. Batches stay under CHUNK_SIZE so numpy_calc_range_angles
-  // never hits its own internal-split overflow -- see mcl_bench_rmgpu.cpp's
-  // safe_batch comment (a real cudaErrorInvalidValue at 8000 particles).
-  const int safe_batch = std::max(1, CHUNK_SIZE / num_rays);
-  for (int off = 0; off < n; off += safe_batch) {
-    int m = std::min(safe_batch, n - off);
-    method.numpy_calc_range_angles(&particles[off * 3], angles.data(),
-                                   &ranges[off * num_rays], m, num_rays);
-  }
+  // path below.
+  rmgpu_cast_all(method, particles, angles, ranges, n, num_rays);
   for (int i = 0; i < n; ++i) {
     double weight = 1.0;
     for (int a = 0; a < num_rays; ++a) {
@@ -512,23 +555,16 @@ measurement_update(MethodT &method, const std::vector<double> &sensor_table,
 }
 
 #if RANGE_METHOD == RANGE_METHOD_RMGPU
-// One-time, untimed sanity check: RayMarchingGPU's batched path applies
-// RangeLib's ROS world->grid transform (theta negation + rotation offset +
-// x/y swap) -- the same transform that caused the 2026-08-18 x/y-swap bug on
-// the CPU side. Cast the initial population on both GPU and CPU RM and
-// compare, so a convention mismatch shows up here as a loud warning rather
-// than as silently wrong weights.
+// One-time, untimed sanity check: cast the initial population through the
+// exact timed GPU path (rmgpu_cast_all, including its convention rewrite) and
+// through CPU RM, and compare -- a convention mismatch shows up here as a loud
+// warning rather than as silently wrong weights.
 static void rmgpu_parity_check(RayMarchingGPU &gpu, RayMarching &cpu,
                                std::vector<float> &particles,
                                std::vector<float> &angles, int n,
                                int num_rays) {
   std::vector<float> gpu_ranges((size_t)n * num_rays);
-  const int safe_batch = std::max(1, CHUNK_SIZE / num_rays);
-  for (int off = 0; off < n; off += safe_batch) {
-    int m = std::min(safe_batch, n - off);
-    gpu.numpy_calc_range_angles(&particles[off * 3], angles.data(),
-                                &gpu_ranges[off * num_rays], m, num_rays);
-  }
+  rmgpu_cast_all(gpu, particles, angles, gpu_ranges, n, num_rays);
   double max_diff = 0.0, sum_diff = 0.0;
   long over_1px = 0;
   for (int i = 0; i < n; ++i) {
