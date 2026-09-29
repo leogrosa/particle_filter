@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <random>
+#include <set>
 #include <sstream>
 #include <string>
 #include <unordered_set>
@@ -594,7 +595,22 @@ static void print_usage(const char *prog) {
   std::fprintf(
       stderr,
       "usage: %s --particles N --rays N --iters N --seed N --out-prefix PATH "
-      "[--trajectory PATH]\n"
+      "[--trajectory PATH] [--scenario converge|static|scatter]\n"
+      "  --scenario    optional: 'converge' (default), 'static' or 'scatter'. "
+      "A preset for the\n"
+      "                flags below; any of those flags passed explicitly "
+      "still wins over the\n"
+      "                preset. The effective values are printed at [setup].\n"
+      "                converge: every default below, unchanged (global init, "
+      "resampling on).\n"
+      "                static:   global init, no resampling, zero velocity and "
+      "zero velocity/\n"
+      "                          motion-dispersion noise -- the same particle "
+      "poses every iteration.\n"
+      "                scatter:  global init, no resampling, zero velocity, "
+      "default motion-\n"
+      "                          dispersion noise -- particles random-walk "
+      "but never converge.\n"
       "  --particles   particle count\n"
       "  --rays        number of LIDAR rays (e.g. 60)\n"
       "  --iters       number of PF iterations to run (every iteration logged, "
@@ -619,7 +635,8 @@ static void print_usage(const char *prog) {
       "informative enough yet to be\n"
       "                worth redistributing mass over (Bagnell, "
       "papers/16831_lecture05_gseyfarth_zbatts.pdf).\n"
-      "                Default 0.2. 0 disables skipping (always resample).\n"
+      "                Default 0.2. 0 (or negative) disables resampling "
+      "entirely.\n"
       "  --squash-factor  optional: squash the raw measurement-update weight "
       "by raising it\n"
       "                to 1/squash_factor before normalizing (see "
@@ -766,6 +783,10 @@ int main(int argc, char **argv) {
   bool verbose = false;
   bool redraw_every_iter = false;
   bool disable_working_set_stats = false;
+  std::string scenario = "converge";
+  // Value-taking flags the user actually passed -- a --scenario preset only
+  // fills in the ones NOT in here, so an explicit flag always wins.
+  std::set<std::string> explicit_args;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -795,7 +816,10 @@ int main(int argc, char **argv) {
       return 1;
     }
     const char *value = argv[++i];
-    if (arg == "--particles")
+    explicit_args.insert(arg);
+    if (arg == "--scenario")
+      scenario = value;
+    else if (arg == "--particles")
       max_particles = std::atoi(value);
     else if (arg == "--rays")
       num_rays = std::atoi(value);
@@ -854,6 +878,46 @@ int main(int argc, char **argv) {
     print_usage(argv[0]);
     return 1;
   }
+  if (scenario != "converge" && scenario != "static" && scenario != "scatter") {
+    std::fprintf(stderr,
+                 "--scenario must be 'converge', 'static' or 'scatter', got: %s\n",
+                 scenario.c_str());
+    print_usage(argv[0]);
+    return 1;
+  }
+  // Scenario presets. Both non-converging scenarios pin velocity to 0: with
+  // no --trajectory the ground truth stands still, and without resampling
+  // nothing pulls 1.8 m/s particles back -- they'd walk ~0.9 px/iter along
+  // their own heading, straight off the map.
+  // TODO: scatter's motion-dispersion random walk (~1 px/iter std) can still
+  // carry particles near the map edge out of bounds over long runs, and
+  // nothing clamps them (giant_lut[(int)x][(int)y] has no bounds check).
+  // Clamp to map bounds in motion_step, scatter only -- noted, not done yet.
+  auto preset = [&](const char *flag, float &field, float v) {
+    if (!explicit_args.count(flag))
+      field = v;
+  };
+  if (scenario == "static" || scenario == "scatter") {
+    preset("--ess-resampling-threshold", ess_resampling_threshold, 0.0f);
+    preset("--nominal-velocity", nominal_velocity, 0.0f);
+  }
+  if (scenario == "static") {
+    preset("--velocity-noise-std", velocity_noise_std, 0.0f);
+    preset("--motion-dispersion-x", motion_dispersion_x, 0.0f);
+    preset("--motion-dispersion-y", motion_dispersion_y, 0.0f);
+    preset("--motion-dispersion-theta", motion_dispersion_theta, 0.0f);
+  }
+  std::printf(
+      "[setup] scenario=%s: init_mode=%s ess_resampling_threshold=%.3f "
+      "roughening_k=%.3f nominal_velocity=%.3f velocity_noise_std=%.3f "
+      "motion_dispersion_x=%.3f motion_dispersion_y=%.3f "
+      "motion_dispersion_theta=%.3f squash_factor=%.3f dt=%.4f "
+      "redraw_every_iter=%d disable_measurement_update=%d\n",
+      scenario.c_str(), init_mode.c_str(), ess_resampling_threshold,
+      roughening_k, nominal_velocity, velocity_noise_std, motion_dispersion_x,
+      motion_dispersion_y, motion_dispersion_theta, squash_factor, dt_seconds,
+      (int)redraw_every_iter, (int)disable_measurement_update);
+  std::fflush(stdout);
   unsigned int seed = (unsigned int)seed_arg;
 
   std::printf("[setup] loading map\n");
@@ -1137,7 +1201,10 @@ int main(int argc, char **argv) {
       log_iter("[iter %d/%d] redraw: sampled %d fresh free-space particles "
                "(scenario II)\n",
                iter, iters - 1, max_particles);
-    } else if (ess > ess_resampling_threshold * max_particles) {
+    } else if (ess_resampling_threshold <= 0.0f ||
+               ess > ess_resampling_threshold * max_particles) {
+      // threshold <= 0 is "never resample" by construction, not by relying on
+      // ESS > 0 (a NaN ESS from fully-underflowed weights compares false).
       log_iter("[iter %d/%d] ESS=%.1f above threshold (%.1f%% of %d) -- "
                "skipping resample\n",
                iter, iters - 1, ess, 100.0 * ess_resampling_threshold,

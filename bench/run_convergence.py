@@ -20,6 +20,12 @@ from its own map + --seed) and still writes DIR/trajectory.csv -- this script ne
 generate or touch a trajectory file itself. --trajectory is plumbed through here purely so a
 future phase can pass a real trajectory file in via a config change, not a code change.
 
+Tunable flags are NOT mirrored here: anything this script doesn't parse itself (--scenario,
+--squash-factor, --avg, --disable-particles-log 1, ...) is forwarded to the binary verbatim, so
+the binary is the single source of truth for every flag and every default -- see
+`mcl_convergence --help`. This script only owns --particles/--rays/--seed defaults (the binary
+has none), --iters/--time, --dt (only to convert --time, then forwarded too), and --out-prefix.
+
 The binary runs via Popen, not a blocking call: its stdout is streamed live and re-logged as it
 arrives, and DIR/timing.csv is polled on a timer to report the first iteration's timing and
 roughly every iters//20 iterations after that -- both best-effort, since no flush was added to
@@ -110,10 +116,7 @@ def _poll_timing_progress(timing_path, iters, stop_event):
                 next_threshold += progress_interval
 
 
-def run_binary(particles, rays, iters, seed, out_prefix, trajectory, dt, squash_factor,
-               roughening_k, ess_resampling_threshold, init_mode, init_std_xy, init_std_theta,
-               disable_measurement_update, motion_dispersion_x, motion_dispersion_y,
-               motion_dispersion_theta, disable_particles_log):
+def run_binary(particles, rays, iters, seed, out_prefix, dt, passthrough):
     cmd = [
         str(BINARY),
         "--particles", str(particles),
@@ -121,21 +124,10 @@ def run_binary(particles, rays, iters, seed, out_prefix, trajectory, dt, squash_
         "--iters", str(iters),
         "--seed", str(seed),
         "--out-prefix", str(out_prefix),
-        "--dt", str(dt),
-        "--squash-factor", str(squash_factor),
-        "--roughening-k", str(roughening_k),
-        "--ess-resampling-threshold", str(ess_resampling_threshold),
-        "--init-mode", str(init_mode),
-        "--init-std-xy", str(init_std_xy),
-        "--init-std-theta", str(init_std_theta),
-        "--disable-measurement-update", "1" if disable_measurement_update else "0",
-        "--motion-dispersion-x", str(motion_dispersion_x),
-        "--motion-dispersion-y", str(motion_dispersion_y),
-        "--motion-dispersion-theta", str(motion_dispersion_theta),
-        "--disable-particles-log", "1" if disable_particles_log else "0",
     ]
-    if trajectory is not None:
-        cmd += ["--trajectory", str(trajectory)]
+    if dt is not None:
+        cmd += ["--dt", str(dt)]
+    cmd += passthrough
 
     logger.info(f"==> Running: {' '.join(cmd)}")
     try:
@@ -168,7 +160,8 @@ def run_binary(particles, rays, iters, seed, out_prefix, trajectory, dt, squash_
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 allow_abbrev=False)  # never swallow a forwarded binary flag by prefix
     ap.add_argument("--particles", type=int, default=2000, help="number of particles (default 2000)")
     ap.add_argument("--rays", type=int, default=60, help="number of LIDAR rays (default 60)")
     ap.add_argument("--iters", type=int, default=None,
@@ -178,83 +171,21 @@ def main():
                      help="simulation duration in seconds, as an alternative to --iters -- "
                           "this script computes iters = ceil(time / dt). Mutually exclusive "
                           "with --iters.")
-    ap.add_argument("--dt", type=float, default=1.0 / 40.0,
-                     help="seconds per iteration (default 1/40s = 40Hz). Used here to convert "
-                          "--time into an iteration count, AND forwarded to the binary's own "
-                          "--dt, which it uses to convert each particle's per-iteration odometry "
-                          "speed reading into a pixel displacement. If you're also passing "
-                          "--trajectory from generate_trajectory.py, keep this matched to "
-                          "that script's --dt, or 'N seconds of simulation' here won't "
-                          "actually correspond to N seconds of the ground-truth robot's "
-                          "motion (mcl_convergence.cpp indexes the trajectory CSV by row "
-                          "number, not by its t column).")
-    ap.add_argument("--squash-factor", type=float, default=2.2,
-                     help="squash the raw measurement-update weight by raising it to "
-                          "1/squash_factor before normalizing, forwarded to the binary's own "
-                          "--squash-factor (see mcl_convergence.cpp's squash_weights(), "
-                          "docs/Lab5.pdf sec 3.2). Default 2.2 matches MIT particle_filter.py's "
-                          "own default (launch/localize.launch); squash_factor=1 disables "
-                          "squashing.")
-    ap.add_argument("--roughening-k", type=float, default=0.2,
-                     help="roughening tuning constant K (Gordon, Salmond & Smith 1993), "
-                          "forwarded to the binary's own --roughening-k. "
-                          "sigma_i = K * E_i * N^(-1/d) added to each particle dimension "
-                          "right after resampling. Default 0.2; K=0 disables roughening.")
-    ap.add_argument("--ess-resampling-threshold", type=float, default=0.5,
-                     help="skip resampling (and roughening) when ESS is above this fraction "
-                          "of N, forwarded to the binary's own --ess-resampling-threshold "
-                          "(see mcl_convergence.cpp's resample skip logic, "
-                          "papers/16831_lecture05_gseyfarth_zbatts.pdf). Default 0.2; 0 "
-                          "disables skipping (always resample).")
-    ap.add_argument("--init-mode", choices=["global", "tracking"], default="global",
-                     help="forwarded to the binary's own --init-mode. 'global' (default) "
-                          "scatters the initial population uniformly across all free-space "
-                          "cells (global localization). 'tracking' draws it from a Gaussian "
-                          "centered on the ground-truth pose at iteration 0 (--init-std-xy / "
-                          "--init-std-theta), simulating a known starting pose.")
-    ap.add_argument("--init-std-xy", type=float, default=0.5,
-                     help="position std dev in meters for --init-mode tracking, forwarded to "
-                          "the binary's own --init-std-xy. Default 0.5.")
-    ap.add_argument("--init-std-theta", type=float, default=0.4,
-                     help="heading std dev in radians for --init-mode tracking, forwarded to "
-                          "the binary's own --init-std-theta. Default 0.4.")
-    ap.add_argument("--disable-measurement-update", action="store_true",
-                     help="skip measurement_update/squash/normalize entirely and set weights "
-                          "uniform every iteration (ESS reads N, so resample/roughen self-skip "
-                          "too), forwarded to the binary's own --disable-measurement-update -- "
-                          "isolates the motion model alone, no sensor feedback, for debugging.")
-    ap.add_argument("--motion-dispersion-x", type=float, default=0.05,
-                     help="residual isotropic x noise std dev in meters, forwarded to the "
-                          "binary's own --motion-dispersion-x (converted to pixels internally "
-                          "via MAP_RESOLUTION). Default 0.05, matching MIT's own "
-                          "motion_dispersion_x ROS param. Pass 0 for a zero-process-noise "
-                          "isolation run.")
-    ap.add_argument("--motion-dispersion-y", type=float, default=0.025,
-                     help="same as --motion-dispersion-x, y axis. Default 0.025.")
-    ap.add_argument("--motion-dispersion-theta", type=float, default=0.25,
-                     help="residual heading noise std dev in radians (added on top of "
-                          "true_delta_theta each iteration), forwarded to the binary's own "
-                          "--motion-dispersion-theta. Default 0.25, matching MIT's own "
-                          "motion_dispersion_theta ROS param.")
+    ap.add_argument("--dt", type=float, default=None,
+                     help="seconds per iteration. Required with --time (to compute "
+                          "iters = ceil(time / dt)); forwarded to the binary's own --dt "
+                          "whenever given. Omit it (without --time) to use the binary's default.")
     ap.add_argument("--seed", type=int, default=42, help="RNG seed (default 42)")
     ap.add_argument("--out-prefix", default=None,
                      help="output directory; the binary writes <dir>/timing.csv, "
                           "<dir>/particles.csv, <dir>/trajectory.csv (created if missing). "
                           "Default: bench/results/<YYYY-MM-DD_HHMMSS>")
-    ap.add_argument("--trajectory", default=None,
-                     help="optional path to a ground-truth trajectory CSV, forwarded to the binary "
-                          "as --trajectory. Unused today (the binary auto-generates a stand-still "
-                          "trajectory when omitted); plumbed through for a future phase.")
-    ap.add_argument("--disable-particles-log", action="store_true",
-                     help="forwarded to the binary's own --disable-particles-log: particles.csv "
-                          "is never opened/written at all (not just left empty), saving disk "
-                          "space on storage-constrained targets. timing.csv/trajectory.csv are "
-                          "unaffected, so convergence.png still plots -- only snapshots.png "
-                          "(plot_convergence.py) is unavailable afterward.")
-    args = ap.parse_args()
+    args, passthrough = ap.parse_known_args()
 
     if args.time is not None and args.iters is not None:
         ap.error("--time and --iters are mutually exclusive -- pass one or the other")
+    if args.time is not None and args.dt is None:
+        ap.error("--time needs an explicit --dt to convert seconds into iterations")
     if args.time is not None:
         iters = math.ceil(args.time / args.dt)
         logger.info(f"==> --time {args.time}s @ dt={args.dt}s -> {iters} iterations")
@@ -271,36 +202,23 @@ def main():
 
     logger.info(
         f"==> Config: particles={args.particles} rays={args.rays} iters={iters} "
-        f"seed={args.seed} squash_factor={args.squash_factor} roughening_k={args.roughening_k} "
-        f"ess_resampling_threshold={args.ess_resampling_threshold} init_mode={args.init_mode} "
-        f"disable_measurement_update={args.disable_measurement_update} "
-        f"motion_dispersion_x={args.motion_dispersion_x} motion_dispersion_y={args.motion_dispersion_y} "
-        f"motion_dispersion_theta={args.motion_dispersion_theta} "
-        f"disable_particles_log={args.disable_particles_log} out_prefix={out_prefix}"
+        f"seed={args.seed} dt={args.dt if args.dt is not None else '(binary default)'} "
+        f"out_prefix={out_prefix}"
     )
-    if args.init_mode == "tracking":
-        logger.info(
-            f"==> init_std_xy={args.init_std_xy}m init_std_theta={args.init_std_theta}rad"
-        )
-    if args.trajectory is not None:
-        logger.info(f"==> Forwarding --trajectory {args.trajectory}")
+    logger.info(f"==> Forwarded to binary as-is: {' '.join(passthrough) or '(nothing)'}")
 
     build_binary()
-    run_binary(args.particles, args.rays, iters, args.seed, out_prefix, args.trajectory, args.dt,
-               args.squash_factor, args.roughening_k, args.ess_resampling_threshold,
-               args.init_mode, args.init_std_xy, args.init_std_theta,
-               args.disable_measurement_update, args.motion_dispersion_x,
-               args.motion_dispersion_y, args.motion_dispersion_theta,
-               args.disable_particles_log)
+    run_binary(args.particles, args.rays, iters, args.seed, out_prefix, args.dt, passthrough)
 
     timing_csv = out_prefix / "timing.csv"
     trajectory_csv = out_prefix / "trajectory.csv"
     logger.info("==> Done. Output CSVs:")
     logger.info(f"    timing:     {timing_csv}")
-    if args.disable_particles_log:
-        logger.info("    particles:  (skipped -- --disable-particles-log)")
+    particles_csv = out_prefix / "particles.csv"
+    if particles_csv.exists():
+        logger.info(f"    particles:  {particles_csv}")
     else:
-        logger.info(f"    particles:  {out_prefix / 'particles.csv'}")
+        logger.info("    particles:  (skipped -- --disable-particles-log)")
     logger.info(f"    trajectory: {trajectory_csv}")
 
 
