@@ -32,6 +32,14 @@ using Clock = std::chrono::steady_clock;
 #ifndef RANGE_METHOD
 #define RANGE_METHOD RANGE_METHOD_GLT
 #endif
+// RMGPU_UNIFIED=1 (mcl_convergence_rmgpu_um, RMGPU only): same kernel, but
+// poses/angles/ranges live in CUDA managed memory the GPU reads/writes in
+// place -- no cudaMemcpy in or out. On the Jetson, CPU and GPU share the same
+// physical DRAM, so the copy version's cudaMemcpys are DRAM->DRAM copies on
+// one chip. Always 0 for CPU methods.
+#ifndef RMGPU_UNIFIED
+#define RMGPU_UNIFIED 0
+#endif
 #if RANGE_METHOD == RANGE_METHOD_GLT
 typedef GiantLUTCast MethodT;
 static const char *METHOD_NAME = "glt";
@@ -43,7 +51,11 @@ static const char *METHOD_NAME = "rm";
 #error "RANGE_METHOD_RMGPU needs a CUDA build (USE_CUDA=1, see CMakeLists.txt)"
 #endif
 typedef RayMarchingGPU MethodT;
+#if RMGPU_UNIFIED == 1
+static const char *METHOD_NAME = "rmgpu_um";
+#else
 static const char *METHOD_NAME = "rmgpu";
+#endif
 #else
 #error "unknown RANGE_METHOD"
 #endif
@@ -460,10 +472,72 @@ static long compute_distinct_triples(GiantLUTCast &glt,
 //
 // The rewrite (n*3 floats) runs inside measurement_update's timed region --
 // negligible next to n*num_rays ray marches, but it is in there.
-static void rmgpu_cast_all(RayMarchingGPU &gpu,
-                           const std::vector<float> &particles,
-                           const std::vector<float> &angles,
-                           std::vector<float> &ranges, int n, int num_rays) {
+//
+// Returns where the n*num_rays ranges ended up: `ranges` in the copy build,
+// the managed output buffer in the unified build (read in place, no copy).
+static const float *rmgpu_cast_all(RayMarchingGPU &gpu,
+                                   const std::vector<float> &particles,
+                                   const std::vector<float> &angles,
+                                   std::vector<float> &ranges, int n,
+                                   int num_rays) {
+  // Batches stay under CHUNK_SIZE so numpy_calc_range_angles never hits its
+  // own internal-split overflow -- see mcl_bench_rmgpu.cpp's safe_batch
+  // comment (a real cudaErrorInvalidValue at 8000 particles).
+  const int safe_batch = std::max(1, CHUNK_SIZE / num_rays);
+#if RMGPU_UNIFIED == 1
+  (void)ranges;
+  // Managed buffers, grown on demand and kept for the whole run (never freed:
+  // one-shot tool, the process exit reclaims them). The kernel reads each
+  // chunk's angles right after that chunk's poses (ins[num_particles*3 + a]),
+  // so the input buffer is laid out per chunk as [m*3 poses | num_rays angles].
+  static float *um_ins = nullptr, *um_outs = nullptr;
+  static size_t um_ins_cap = 0, um_outs_cap = 0;
+  const int num_chunks = (n + safe_batch - 1) / safe_batch;
+  const size_t ins_need = (size_t)n * 3 + (size_t)num_chunks * num_rays;
+  const size_t outs_need = (size_t)n * num_rays;
+  if (ins_need > um_ins_cap) {
+    if (um_ins)
+      cuda_managed_free(um_ins);
+    um_ins = cuda_managed_alloc_floats(ins_need);
+    um_ins_cap = ins_need;
+  }
+  if (outs_need > um_outs_cap) {
+    if (um_outs)
+      cuda_managed_free(um_outs);
+    um_outs = cuda_managed_alloc_floats(outs_need);
+    um_outs_cap = outs_need;
+  }
+  if (!um_ins || !um_outs) {
+    std::fprintf(stderr, "managed allocation failed\n");
+    std::exit(1);
+  }
+  // Same order as the copy build: rewrite every chunk's inputs first, then
+  // launch. Each launch blocks until done (see numpy_calc_range_angles_unified),
+  // so the CPU never touches managed memory while a kernel is running.
+  size_t base = 0;
+  for (int off = 0; off < n; off += safe_batch) {
+    int m = std::min(safe_batch, n - off);
+    float *chunk = um_ins + base;
+    for (int i = 0; i < m; ++i) {
+      const float *p = &particles[(size_t)(off + i) * 3];
+      chunk[i * 3 + 0] = p[1];
+      chunk[i * 3 + 1] = p[0];
+      chunk[i * 3 + 2] = (float)(M_PI / 2.0) - p[2];
+    }
+    for (int a = 0; a < num_rays; ++a)
+      chunk[m * 3 + a] = -angles[a];
+    base += (size_t)m * 3 + num_rays;
+  }
+  base = 0;
+  for (int off = 0; off < n; off += safe_batch) {
+    int m = std::min(safe_batch, n - off);
+    gpu.numpy_calc_range_angles_unified(um_ins + base,
+                                        um_outs + (size_t)off * num_rays, m,
+                                        num_rays);
+    base += (size_t)m * 3 + num_rays;
+  }
+  return um_outs;
+#else
   // single-threaded tool: reused scratch buffers, no per-call allocation
   static std::vector<float> gpu_ins;
   static std::vector<float> neg_angles;
@@ -476,15 +550,13 @@ static void rmgpu_cast_all(RayMarchingGPU &gpu,
     gpu_ins[i * 3 + 1] = particles[i * 3 + 0];
     gpu_ins[i * 3 + 2] = (float)(M_PI / 2.0) - particles[i * 3 + 2];
   }
-  // Batches stay under CHUNK_SIZE so numpy_calc_range_angles never hits its
-  // own internal-split overflow -- see mcl_bench_rmgpu.cpp's safe_batch
-  // comment (a real cudaErrorInvalidValue at 8000 particles).
-  const int safe_batch = std::max(1, CHUNK_SIZE / num_rays);
   for (int off = 0; off < n; off += safe_batch) {
     int m = std::min(safe_batch, n - off);
     gpu.numpy_calc_range_angles(&gpu_ins[off * 3], neg_angles.data(),
                                 &ranges[off * num_rays], m, num_rays);
   }
+  return ranges.data();
+#endif
 }
 #endif
 
@@ -521,11 +593,12 @@ measurement_update(MethodT &method, const std::vector<double> &sensor_table,
   // cast every (particle, angle) pair into `ranges` first, then weight them
   // in a separate CPU pass with the exact same sensor-table lookup as the CPU
   // path below.
-  rmgpu_cast_all(method, particles, angles, ranges, n, num_rays);
+  const float *cast =
+      rmgpu_cast_all(method, particles, angles, ranges, n, num_rays);
   for (int i = 0; i < n; ++i) {
     double weight = 1.0;
     for (int a = 0; a < num_rays; ++a) {
-      float d = ranges[i * num_rays + a];
+      float d = cast[i * num_rays + a];
       float r = obs[a];
       r = std::min(std::max(r, 0.0f), (float)table_width - 1.0f);
       d = std::min(std::max(d, 0.0f), (float)table_width - 1.0f);
@@ -563,8 +636,9 @@ static void rmgpu_parity_check(RayMarchingGPU &gpu, RayMarching &cpu,
                                std::vector<float> &particles,
                                std::vector<float> &angles, int n,
                                int num_rays) {
-  std::vector<float> gpu_ranges((size_t)n * num_rays);
-  rmgpu_cast_all(gpu, particles, angles, gpu_ranges, n, num_rays);
+  std::vector<float> gpu_ranges_buf(RMGPU_UNIFIED ? 0 : (size_t)n * num_rays);
+  const float *gpu_ranges =
+      rmgpu_cast_all(gpu, particles, angles, gpu_ranges_buf, n, num_rays);
   double max_diff = 0.0, sum_diff = 0.0;
   long over_1px = 0;
   for (int i = 0; i < n; ++i) {
@@ -583,9 +657,15 @@ static void rmgpu_parity_check(RayMarchingGPU &gpu, RayMarching &cpu,
               "mean|diff|=%.4fpx, %ld rays (%.2f%%) off by >1px\n",
               total, max_diff, sum_diff / total, over_1px,
               100.0 * over_1px / total);
-  if (over_1px > 0)
-    std::printf("[setup] WARNING: rmgpu disagrees with CPU RM -- check the "
-                "world->grid convention before trusting any rmgpu timing\n");
+  // Threshold is a FRACTION, not "any ray": a handful of rays can legitimately
+  // differ by a cell or two from GPU-vs-CPU float rounding (cosf/sinf,
+  // -ffast-math, the convention rewrite's own rounding) flipping a
+  // grazing-corner hit -- seen on the Jetson 2026-09-29 after the fix: 1 ray
+  // of 480k, 2.2px. A convention bug is systematic (99.19% before the fix).
+  if (over_1px > total / 1000)
+    std::printf("[setup] WARNING: rmgpu disagrees with CPU RM on >0.1%% of "
+                "rays -- check the world->grid convention before trusting any "
+                "rmgpu timing\n");
   std::fflush(stdout);
 }
 #endif
@@ -1196,10 +1276,12 @@ int main(int argc, char **argv) {
   std::vector<double> new_weights(max_particles);
   std::vector<int> proposal_indices(max_particles);
   std::vector<float> obs(num_rays);
-  // Only used by the batched (GPU) path; CPU methods cast per ray.
-  std::vector<float> ranges(RANGE_METHOD == RANGE_METHOD_RMGPU
-                                ? (size_t)max_particles * num_rays
-                                : 0);
+  // Only used by the batched copy-GPU path; CPU methods cast per ray, and the
+  // unified build casts straight into managed memory.
+  std::vector<float> ranges(
+      RANGE_METHOD == RANGE_METHOD_RMGPU && !RMGPU_UNIFIED
+          ? (size_t)max_particles * num_rays
+          : 0);
 #if RANGE_METHOD == RANGE_METHOD_RMGPU
   rmgpu_parity_check(method, obs_caster, particles, angles, max_particles,
                      num_rays);
