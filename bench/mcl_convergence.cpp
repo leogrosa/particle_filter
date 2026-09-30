@@ -22,23 +22,27 @@ using Clock = std::chrono::steady_clock;
 
 // Range method under test, fixed at compile time (one CMake target per method,
 // all built from this file): mcl_convergence (GLT, the default),
-// mcl_convergence_rm, mcl_convergence_rmgpu (WITH_CUDA only). MethodT is the
+// mcl_convergence_rm, and the WITH_CUDA-only GPU ones: mcl_convergence_rmgpu,
+// mcl_convergence_gltgpu (+ their _um unified-memory twins). MethodT is the
 // concrete class, so calls go straight to it -- same as the old hardcoded
 // GiantLUTCast &glt, no extra RangeMethod& indirection that would perturb the
 // GLT timings already collected.
 #define RANGE_METHOD_GLT 0
 #define RANGE_METHOD_RM 1
 #define RANGE_METHOD_RMGPU 2
+#define RANGE_METHOD_GLTGPU 3
 #ifndef RANGE_METHOD
 #define RANGE_METHOD RANGE_METHOD_GLT
 #endif
-// RMGPU_UNIFIED=1 (mcl_convergence_rmgpu_um, RMGPU only): same kernel, but
+#define IS_GPU_METHOD                                                          \
+  (RANGE_METHOD == RANGE_METHOD_RMGPU || RANGE_METHOD == RANGE_METHOD_GLTGPU)
+// GPU_UNIFIED=1 (the *_um binaries, GPU methods only): same kernel, but
 // poses/angles/ranges live in CUDA managed memory the GPU reads/writes in
-// place -- no cudaMemcpy in or out. On the Jetson, CPU and GPU share the same
-// physical DRAM, so the copy version's cudaMemcpys are DRAM->DRAM copies on
-// one chip. Always 0 for CPU methods.
-#ifndef RMGPU_UNIFIED
-#define RMGPU_UNIFIED 0
+// place -- no per-call cudaMemcpy in or out. On the Jetson, CPU and GPU share
+// the same physical DRAM, so the copy version's cudaMemcpys are DRAM->DRAM
+// copies on one chip. Always 0 for CPU methods.
+#ifndef GPU_UNIFIED
+#define GPU_UNIFIED 0
 #endif
 #if RANGE_METHOD == RANGE_METHOD_GLT
 typedef GiantLUTCast MethodT;
@@ -51,10 +55,20 @@ static const char *METHOD_NAME = "rm";
 #error "RANGE_METHOD_RMGPU needs a CUDA build (USE_CUDA=1, see CMakeLists.txt)"
 #endif
 typedef RayMarchingGPU MethodT;
-#if RMGPU_UNIFIED == 1
+#if GPU_UNIFIED == 1
 static const char *METHOD_NAME = "rmgpu_um";
 #else
 static const char *METHOD_NAME = "rmgpu";
+#endif
+#elif RANGE_METHOD == RANGE_METHOD_GLTGPU
+#if USE_CUDA != 1
+#error "RANGE_METHOD_GLTGPU needs a CUDA build (USE_CUDA=1, see CMakeLists.txt)"
+#endif
+typedef GiantLUTCastGPU MethodT;
+#if GPU_UNIFIED == 1
+static const char *METHOD_NAME = "gltgpu_um";
+#else
+static const char *METHOD_NAME = "gltgpu";
 #endif
 #else
 #error "unknown RANGE_METHOD"
@@ -450,10 +464,11 @@ static long compute_distinct_triples(GiantLUTCast &glt,
 }
 #endif
 
-#if RANGE_METHOD == RANGE_METHOD_RMGPU
-// Casts every (particle, angle) pair on the GPU into `ranges`, in the SAME
-// convention as CPU RayMarching::calc_range. Used by both measurement_update
-// and rmgpu_parity_check, so the parity check validates exactly the timed path.
+#if IS_GPU_METHOD
+// Casts every (particle, angle) pair on the GPU (RayMarchingGPU or
+// GiantLUTCastGPU) into `ranges`, in the SAME convention as the CPU methods'
+// calc_range. Used by both measurement_update and gpu_parity_check, so the
+// parity check validates exactly the timed path.
 //
 // Why the input rewrite: RayMarchingGPU::numpy_calc_range_angles always runs
 // kernels.cu's ROS world->grid front-end (cuda_ray_marching_angles_world_to_grid,
@@ -470,21 +485,27 @@ static long compute_distinct_triples(GiantLUTCast &glt,
 // (set_identity_ros_transform), which is all this tool uses. range_libc
 // itself is left untouched (the mit-racecar node depends on it).
 //
+// GiantLUTCastGPU's kernel (cuda_giant_lut_lookup_angles, ~kernels.cu:346)
+// copies that exact front-end (same swap, same heading formula), so the same
+// rewrite applies: its glt_discretize_theta wraps theta + a - 2pi back into
+// [0, 2pi) the same way the CPU GiantLUTCast::discretize_theta does.
+//
 // The rewrite (n*3 floats) runs inside measurement_update's timed region --
 // negligible next to n*num_rays ray marches, but it is in there.
 //
 // Returns where the n*num_rays ranges ended up: `ranges` in the copy build,
 // the managed output buffer in the unified build (read in place, no copy).
-static const float *rmgpu_cast_all(RayMarchingGPU &gpu,
-                                   const std::vector<float> &particles,
-                                   const std::vector<float> &angles,
-                                   std::vector<float> &ranges, int n,
-                                   int num_rays) {
-  // Batches stay under CHUNK_SIZE so numpy_calc_range_angles never hits its
-  // own internal-split overflow -- see mcl_bench_rmgpu.cpp's safe_batch
-  // comment (a real cudaErrorInvalidValue at 8000 particles).
+static const float *gpu_cast_all(MethodT &gpu,
+                                 const std::vector<float> &particles,
+                                 const std::vector<float> &angles,
+                                 std::vector<float> &ranges, int n,
+                                 int num_rays) {
+  // Batches stay under CHUNK_SIZE: RayMarchingGPU's numpy_calc_range_angles
+  // would otherwise hit its own internal-split overflow (see
+  // mcl_bench_rmgpu.cpp's safe_batch comment -- a real cudaErrorInvalidValue
+  // at 8000 particles), and GiantLUTCastGPU doesn't chunk internally at all.
   const int safe_batch = std::max(1, CHUNK_SIZE / num_rays);
-#if RMGPU_UNIFIED == 1
+#if GPU_UNIFIED == 1
   (void)ranges;
   // Managed buffers, grown on demand and kept for the whole run (never freed:
   // one-shot tool, the process exit reclaims them). The kernel reads each
@@ -588,13 +609,13 @@ measurement_update(MethodT &method, const std::vector<double> &sensor_table,
 #endif
 
   auto t0 = Clock::now();
-#if RANGE_METHOD == RANGE_METHOD_RMGPU
-  // RayMarchingGPU is batched-only (its calc_range refuses single rays), so:
+#if IS_GPU_METHOD
+  // The GPU methods are batched-only (its calc_range refuses single rays), so:
   // cast every (particle, angle) pair into `ranges` first, then weight them
   // in a separate CPU pass with the exact same sensor-table lookup as the CPU
   // path below.
   const float *cast =
-      rmgpu_cast_all(method, particles, angles, ranges, n, num_rays);
+      gpu_cast_all(method, particles, angles, ranges, n, num_rays);
   for (int i = 0; i < n; ++i) {
     double weight = 1.0;
     for (int a = 0; a < num_rays; ++a) {
@@ -627,24 +648,26 @@ measurement_update(MethodT &method, const std::vector<double> &sensor_table,
   return std::chrono::duration<double, std::milli>(t1 - t0).count();
 }
 
-#if RANGE_METHOD == RANGE_METHOD_RMGPU
+#if IS_GPU_METHOD
 // One-time, untimed sanity check: cast the initial population through the
-// exact timed GPU path (rmgpu_cast_all, including its convention rewrite) and
-// through CPU RM, and compare -- a convention mismatch shows up here as a loud
-// warning rather than as silently wrong weights.
-static void rmgpu_parity_check(RayMarchingGPU &gpu, RayMarching &cpu,
-                               std::vector<float> &particles,
-                               std::vector<float> &angles, int n,
-                               int num_rays) {
-  std::vector<float> gpu_ranges_buf(RMGPU_UNIFIED ? 0 : (size_t)n * num_rays);
+// exact timed GPU path (gpu_cast_all, including its convention rewrite) and
+// through a CPU reference (`ref`, called like calc_range), and compare -- a
+// convention mismatch shows up here as a loud warning rather than as silently
+// wrong weights. Reference: CPU RM for rmgpu, CPU GiantLUTCast for gltgpu
+// (the LUT's 112 theta bins legitimately move some rays a lot vs. exact RM).
+template <class RefFn>
+static void gpu_parity_check(MethodT &gpu, RefFn ref, const char *ref_name,
+                             std::vector<float> &particles,
+                             std::vector<float> &angles, int n, int num_rays) {
+  std::vector<float> gpu_ranges_buf(GPU_UNIFIED ? 0 : (size_t)n * num_rays);
   const float *gpu_ranges =
-      rmgpu_cast_all(gpu, particles, angles, gpu_ranges_buf, n, num_rays);
+      gpu_cast_all(gpu, particles, angles, gpu_ranges_buf, n, num_rays);
   double max_diff = 0.0, sum_diff = 0.0;
   long over_1px = 0;
   for (int i = 0; i < n; ++i) {
     for (int a = 0; a < num_rays; ++a) {
-      float c = cpu.calc_range(particles[i * 3 + 0], particles[i * 3 + 1],
-                               particles[i * 3 + 2] + angles[a]);
+      float c = ref(particles[i * 3 + 0], particles[i * 3 + 1],
+                    particles[i * 3 + 2] + angles[a]);
       double diff = std::fabs((double)gpu_ranges[i * num_rays + a] - c);
       max_diff = std::max(max_diff, diff);
       sum_diff += diff;
@@ -653,19 +676,21 @@ static void rmgpu_parity_check(RayMarchingGPU &gpu, RayMarching &cpu,
     }
   }
   long total = (long)n * num_rays;
-  std::printf("[setup] rmgpu parity vs CPU RM over %ld rays: max|diff|=%.3fpx "
+  std::printf("[setup] %s parity vs %s over %ld rays: max|diff|=%.3fpx "
               "mean|diff|=%.4fpx, %ld rays (%.2f%%) off by >1px\n",
-              total, max_diff, sum_diff / total, over_1px,
-              100.0 * over_1px / total);
+              METHOD_NAME, ref_name, total, max_diff, sum_diff / total,
+              over_1px, 100.0 * over_1px / total);
   // Threshold is a FRACTION, not "any ray": a handful of rays can legitimately
   // differ by a cell or two from GPU-vs-CPU float rounding (cosf/sinf,
   // -ffast-math, the convention rewrite's own rounding) flipping a
   // grazing-corner hit -- seen on the Jetson 2026-09-29 after the fix: 1 ray
   // of 480k, 2.2px. A convention bug is systematic (99.19% before the fix).
+  // For the LUT the same rounding can flip a theta bin at a bin edge instead.
   if (over_1px > total / 1000)
-    std::printf("[setup] WARNING: rmgpu disagrees with CPU RM on >0.1%% of "
-                "rays -- check the world->grid convention before trusting any "
-                "rmgpu timing\n");
+    std::printf("[setup] WARNING: %s disagrees with %s on >0.1%% of rays -- "
+                "check the world->grid convention before trusting any %s "
+                "timing\n",
+                METHOD_NAME, ref_name, METHOD_NAME);
   std::fflush(stdout);
 }
 #endif
@@ -961,6 +986,14 @@ static void print_usage(const char *prog) {
       "the maximally-\n"
       "                decorrelated control, zero iteration-to-iteration "
       "particle overlap.\n"
+      "  --parity-check  optional flag (no value), gltgpu/gltgpu_um only. "
+      "Builds a CPU\n"
+      "                GiantLUTCast (~64s, a few hundred MB, freed right "
+      "after) and compares the\n"
+      "                GPU LUT against it on the initial particles. rmgpu "
+      "always runs its (cheap)\n"
+      "                parity check against CPU RM; CPU methods ignore this "
+      "flag.\n"
       "  --disable-working-set-stats  optional flag (no value). Skips "
       "building the\n"
       "                distinct_cells/distinct_triples unordered_set "
@@ -981,7 +1014,8 @@ static void print_usage(const char *prog) {
       "\n"
       "Range method is fixed at build time (mcl_convergence = GLT, "
       "mcl_convergence_rm = RM,\n"
-      "mcl_convergence_rmgpu = RMGPU). "
+      "mcl_convergence_rmgpu = RMGPU,\n"
+      "mcl_convergence_gltgpu = GLTGPU, *_um = unified-memory GPU variants). "
       "Runs that method's real MCL hot path for "
       "--iters iterations,\n"
       "logging every iteration individually -- not averaged like "
@@ -1018,6 +1052,7 @@ int main(int argc, char **argv) {
   bool verbose = false;
   bool redraw_every_iter = false;
   bool disable_working_set_stats = false;
+  bool parity_check = false;
   std::string scenario = "converge";
   // Value-taking flags the user actually passed -- a --scenario preset only
   // fills in the ones NOT in here, so an explicit flag always wins.
@@ -1043,6 +1078,10 @@ int main(int argc, char **argv) {
     }
     if (arg == "--disable-working-set-stats") {
       disable_working_set_stats = true;
+      continue;
+    }
+    if (arg == "--parity-check") {
+      parity_check = true;
       continue;
     }
     if (i + 1 >= argc) {
@@ -1199,13 +1238,16 @@ int main(int argc, char **argv) {
   // slow -- a one-time cost paid here, not per-iteration, same pattern as
   // mcl_bench_lut.cpp.
   std::printf("[setup] building range method '%s'%s\n", METHOD_NAME,
-              RANGE_METHOD == RANGE_METHOD_GLT
+              RANGE_METHOD == RANGE_METHOD_GLT ||
+                      RANGE_METHOD == RANGE_METHOD_GLTGPU
                   ? " (LUT: this is the slow one-time step)"
                   : "");
   std::fflush(stdout);
 #if RANGE_METHOD == RANGE_METHOD_GLT
   MethodT method(map, max_range_px, THETA_DISCRETIZATION);
   method.set_sensor_model(sensor_table.data(), table_width);
+#elif RANGE_METHOD == RANGE_METHOD_GLTGPU
+  MethodT method(map, max_range_px, THETA_DISCRETIZATION);
 #else
   MethodT method(map, max_range_px);
 #endif
@@ -1279,12 +1321,36 @@ int main(int argc, char **argv) {
   // Only used by the batched copy-GPU path; CPU methods cast per ray, and the
   // unified build casts straight into managed memory.
   std::vector<float> ranges(
-      RANGE_METHOD == RANGE_METHOD_RMGPU && !RMGPU_UNIFIED
+      IS_GPU_METHOD && !GPU_UNIFIED
           ? (size_t)max_particles * num_rays
           : 0);
 #if RANGE_METHOD == RANGE_METHOD_RMGPU
-  rmgpu_parity_check(method, obs_caster, particles, angles, max_particles,
-                     num_rays);
+  gpu_parity_check(
+      method,
+      [&](float x, float y, float h) { return obs_caster.calc_range(x, y, h); },
+      "CPU RM", particles, angles, max_particles, num_rays);
+#endif
+#if RANGE_METHOD != RANGE_METHOD_GLTGPU
+  (void)parity_check;
+#endif
+#if RANGE_METHOD == RANGE_METHOD_GLTGPU
+  // Opt-in: the reference is a whole second (CPU) LUT -- ~64s to build and a
+  // few hundred MB, freed at the end of this block. Always-on would slow every
+  // run and pile that build's memory traffic into any `perf stat` reading.
+  if (parity_check) {
+    std::printf("[setup] --parity-check: building a CPU GiantLUTCast as the "
+                "reference (slow, freed right after)\n");
+    std::fflush(stdout);
+    GiantLUTCast ref_glt(map, max_range_px, THETA_DISCRETIZATION);
+    gpu_parity_check(
+        method,
+        [&](float x, float y, float h) { return ref_glt.calc_range(x, y, h); },
+        "CPU GLT", particles, angles, max_particles, num_rays);
+  } else {
+    std::printf("[setup] gltgpu parity check skipped (pass --parity-check to "
+                "compare against a CPU GiantLUTCast)\n");
+    std::fflush(stdout);
+  }
 #endif
 
   std::normal_distribution<float> noise_x(0.0f,

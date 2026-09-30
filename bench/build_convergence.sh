@@ -5,9 +5,9 @@
 # the first time (no CMakeCache.txt yet), then always let make's own dependency tracking decide
 # whether there's anything to rebuild.
 #
-# Usage: build_convergence.sh [glt|rm|rmgpu|rmgpu_um]   (default: glt)
-# The range method is fixed at compile time, one binary per method. rmgpu needs CUDA (Jetson
-# only), so it gets its own build dir configured WITH_CUDA=ON -- the CPU dir stays CUDA-free.
+# Usage: build_convergence.sh [glt|rm|rmgpu|rmgpu_um|gltgpu|gltgpu_um]   (default: glt)
+# The range method is fixed at compile time, one binary per method. The GPU ones need CUDA (Jetson
+# only), so they get their own build dir configured WITH_CUDA=ON -- the CPU dir stays CUDA-free.
 set -euo pipefail
 
 METHOD="${1:-glt}"
@@ -16,7 +16,9 @@ case "$METHOD" in
 	rm)    TARGET=mcl_convergence_rm;    BUILD_DIR=build_convergence;      WITH_CUDA=OFF ;;
 	rmgpu) TARGET=mcl_convergence_rmgpu; BUILD_DIR=build_convergence_cuda; WITH_CUDA=ON ;;
 	rmgpu_um) TARGET=mcl_convergence_rmgpu_um; BUILD_DIR=build_convergence_cuda; WITH_CUDA=ON ;;
-	*) echo "unknown method '$METHOD' (want glt, rm, rmgpu or rmgpu_um)" >&2; exit 1 ;;
+	gltgpu) TARGET=mcl_convergence_gltgpu; BUILD_DIR=build_convergence_cuda; WITH_CUDA=ON ;;
+	gltgpu_um) TARGET=mcl_convergence_gltgpu_um; BUILD_DIR=build_convergence_cuda; WITH_CUDA=ON ;;
+	*) echo "unknown method '$METHOD' (want glt, rm, rmgpu, rmgpu_um, gltgpu or gltgpu_um)" >&2; exit 1 ;;
 esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

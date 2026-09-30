@@ -111,12 +111,28 @@ if(WITH_CUDA)
 	target_link_libraries(mcl_convergence_rmgpu pthread)
 
 	# Same as mcl_convergence_rmgpu, but unified (managed) memory instead of cudaMemcpy staging --
-	# the only difference between the two binaries (RMGPU_UNIFIED, see mcl_convergence.cpp), so
+	# the only difference between the two binaries (GPU_UNIFIED, see mcl_convergence.cpp), so
 	# their timing difference is the copy cost on the Jetson's shared-DRAM SoC.
 	cuda_add_executable(mcl_convergence_rmgpu_um mcl_convergence.cpp
 		${RANGE_LIBC_DIR}/includes/kernels.cu
 		${RANGE_LIBC_DIR}/vendor/lodepng/lodepng.cpp)
 	target_compile_definitions(mcl_convergence_rmgpu_um PRIVATE RANGE_METHOD=RANGE_METHOD_RMGPU
-		RMGPU_UNIFIED=1 USE_CUDA=1 CHUNK_SIZE=262144 NUM_THREADS=256)
+		GPU_UNIFIED=1 USE_CUDA=1 CHUNK_SIZE=262144 NUM_THREADS=256)
 	target_link_libraries(mcl_convergence_rmgpu_um pthread)
+
+	# mcl_convergence with GiantLUTCastGPU as the range method, copy (cudaMemcpy) and unified-memory
+	# variants -- same pairing as rmgpu / rmgpu_um above.
+	cuda_add_executable(mcl_convergence_gltgpu mcl_convergence.cpp
+		${RANGE_LIBC_DIR}/includes/kernels.cu
+		${RANGE_LIBC_DIR}/vendor/lodepng/lodepng.cpp)
+	target_compile_definitions(mcl_convergence_gltgpu PRIVATE RANGE_METHOD=RANGE_METHOD_GLTGPU
+		USE_CUDA=1 CHUNK_SIZE=262144 NUM_THREADS=256)
+	target_link_libraries(mcl_convergence_gltgpu pthread)
+
+	cuda_add_executable(mcl_convergence_gltgpu_um mcl_convergence.cpp
+		${RANGE_LIBC_DIR}/includes/kernels.cu
+		${RANGE_LIBC_DIR}/vendor/lodepng/lodepng.cpp)
+	target_compile_definitions(mcl_convergence_gltgpu_um PRIVATE RANGE_METHOD=RANGE_METHOD_GLTGPU
+		GPU_UNIFIED=1 USE_CUDA=1 CHUNK_SIZE=262144 NUM_THREADS=256)
+	target_link_libraries(mcl_convergence_gltgpu_um pthread)
 endif()

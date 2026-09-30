@@ -51,6 +51,8 @@ BINARIES = {
     "rm": BENCH_DIR / "build_convergence" / "bin" / "mcl_convergence_rm",
     "rmgpu": BENCH_DIR / "build_convergence_cuda" / "bin" / "mcl_convergence_rmgpu",
     "rmgpu_um": BENCH_DIR / "build_convergence_cuda" / "bin" / "mcl_convergence_rmgpu_um",
+    "gltgpu": BENCH_DIR / "build_convergence_cuda" / "bin" / "mcl_convergence_gltgpu",
+    "gltgpu_um": BENCH_DIR / "build_convergence_cuda" / "bin" / "mcl_convergence_gltgpu_um",
 }
 DEFAULT_RESULTS_DIR = BENCH_DIR / "results"
 
@@ -170,7 +172,7 @@ def main():
                                  allow_abbrev=False)  # never swallow a forwarded binary flag by prefix
     ap.add_argument("--method", choices=sorted(BINARIES), default="glt",
                      help="range method, i.e. which compile-time variant to build and run "
-                          "(default glt). rmgpu/rmgpu_um need CUDA (Jetson only).")
+                          "(default glt). The GPU methods (rmgpu*, gltgpu*) need CUDA (Jetson only).")
     ap.add_argument("--particles", type=int, default=2000, help="number of particles (default 2000)")
     ap.add_argument("--rays", type=int, default=60, help="number of LIDAR rays (default 60)")
     ap.add_argument("--iters", type=int, default=None,
