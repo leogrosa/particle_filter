@@ -587,7 +587,8 @@ measurement_update(MethodT &method, const std::vector<double> &sensor_table,
                    std::vector<float> &angles, std::vector<float> &obs,
                    std::vector<double> &new_weights, std::vector<float> &ranges,
                    int n, int num_rays, bool track_distinct_triples,
-                   long &distinct_triples) {
+                   long &distinct_triples, double &ms_gpu_cast,
+                   double &ms_weighting) {
   // track_distinct_triples gates compute_distinct_triples entirely -- see
   // the comment on compute_working_set_stats above. This one matters far
   // more: its unordered_set can hold up to n*num_rays entries (vs.
@@ -614,8 +615,18 @@ measurement_update(MethodT &method, const std::vector<double> &sensor_table,
   // cast every (particle, angle) pair into `ranges` first, then weight them
   // in a separate CPU pass with the exact same sensor-table lookup as the CPU
   // path below.
+  //
+  // That separation makes a clean sub-split possible: ms_gpu_cast is
+  // gpu_cast_all (input rewrite + kernel launches + copies in the copy build),
+  // ms_weighting the CPU sensor-table pass. The cut point is valid because
+  // gpu_cast_all only returns once every launch has finished (copy build: the
+  // blocking cudaMemcpy back; unified build: the per-chunk
+  // cudaDeviceSynchronize). Caveat for the unified build: any cost of the
+  // CPU's first touch of the managed output buffer after the kernel lands in
+  // ms_weighting, not ms_gpu_cast.
   const float *cast =
       gpu_cast_all(method, particles, angles, ranges, n, num_rays);
+  auto t_cast = Clock::now();
   for (int i = 0; i < n; ++i) {
     double weight = 1.0;
     for (int a = 0; a < num_rays; ++a) {
@@ -627,8 +638,16 @@ measurement_update(MethodT &method, const std::vector<double> &sensor_table,
     }
     new_weights[i] = weight;
   }
+  auto t1 = Clock::now();
+  ms_gpu_cast = std::chrono::duration<double, std::milli>(t_cast - t0).count();
+  ms_weighting = std::chrono::duration<double, std::milli>(t1 - t_cast).count();
 #else
   (void)ranges; // CPU methods cast per ray, fused with weighting
+  // Fused per ray, so there's no cut point to time; -1 sentinel, same
+  // convention as distinct_triples. Un-fusing it just to time it would change
+  // the very access pattern being measured.
+  ms_gpu_cast = -1.0;
+  ms_weighting = -1.0;
   for (int i = 0; i < n; ++i) {
     float px = particles[i * 3 + 0];
     float py = particles[i * 3 + 1];
@@ -643,8 +662,8 @@ measurement_update(MethodT &method, const std::vector<double> &sensor_table,
     }
     new_weights[i] = weight;
   }
-#endif
   auto t1 = Clock::now();
+#endif
   return std::chrono::duration<double, std::milli>(t1 - t0).count();
 }
 
@@ -842,10 +861,12 @@ static void log_particles(FILE *f, int iter,
 static void log_timing_row(FILE *f, int iter, long distinct_cells,
                            double mean_dist_to_true, double stddev_x,
                            double stddev_y, double ms_range_sensor,
-                           double ess, long distinct_triples) {
-  std::fprintf(f, "%d,%ld,%.6f,%.6f,%.6f,%.6f,%.6f,%ld\n", iter, distinct_cells,
-               mean_dist_to_true, stddev_x, stddev_y, ms_range_sensor, ess,
-               distinct_triples);
+                           double ess, long distinct_triples,
+                           double ms_gpu_cast, double ms_weighting) {
+  std::fprintf(f, "%d,%ld,%.6f,%.6f,%.6f,%.6f,%.6f,%ld,%.6f,%.6f\n", iter,
+               distinct_cells, mean_dist_to_true, stddev_x, stddev_y,
+               ms_range_sensor, ess, distinct_triples, ms_gpu_cast,
+               ms_weighting);
 }
 
 static void print_usage(const char *prog) {
@@ -1253,6 +1274,28 @@ int main(int argc, char **argv) {
 #endif
   std::printf("[setup] range method '%s' built\n", METHOD_NAME);
   std::fflush(stdout);
+#if IS_GPU_METHOD
+  {
+    // Mirrors gpu_cast_all's chunking and kernels.cu's launch, which is
+    // always <<<CHUNK_SIZE / NUM_THREADS, NUM_THREADS>>> regardless of how
+    // many queries a chunk actually holds -- surplus threads only run the
+    // bounds check and exit.
+    const int safe_batch = std::max(1, CHUNK_SIZE / num_rays);
+    const long launches = (max_particles + safe_batch - 1) / safe_batch;
+    const long blocks = CHUNK_SIZE / NUM_THREADS;
+    const long launched = launches * blocks * NUM_THREADS;
+    const long useful = (long)max_particles * num_rays;
+    std::printf("[setup] gpu launch: %ld blocks x %d threads/block = %ld "
+                "threads/launch, %ld launch(es)/measurement update "
+                "(<= %d particles each); %ld useful queries of %ld threads "
+                "launched (%.1f%%)\n",
+                blocks, NUM_THREADS, blocks * NUM_THREADS, launches, safe_batch,
+                useful, launched, 100.0 * (double)useful / (double)launched);
+  }
+#else
+  std::printf("[setup] cpu method: single-threaded (one ray at a time)\n");
+#endif
+  std::fflush(stdout);
 
   std::mt19937 rng(seed);
   std::vector<float> angles = make_angles(num_rays);
@@ -1385,7 +1428,8 @@ int main(int argc, char **argv) {
   }
 
   std::fprintf(f_timing, "iter,distinct_cells,mean_dist_to_true,stddev_x,"
-                         "stddev_y,ms_range_sensor,ess,distinct_triples\n");
+                         "stddev_y,ms_range_sensor,ess,distinct_triples,"
+                         "ms_gpu_cast,ms_weighting\n");
   if (f_particles)
     std::fprintf(f_particles, "iter,particle_id,x,y,theta,weight\n");
   std::fprintf(f_trajectory, "iter,t,x,y,theta,vx,vy\n");
@@ -1403,6 +1447,8 @@ int main(int argc, char **argv) {
   // steady-state ~1.6ms, same params).
   double sum_ms_motion = 0.0;
   double sum_ms_range_sensor = 0.0;
+  double sum_ms_gpu_cast = 0.0;
+  double sum_ms_weighting = 0.0;
   double sum_ms_squash = 0.0;
   double sum_ms_normalize = 0.0;
   double sum_ms_ess = 0.0;
@@ -1446,6 +1492,8 @@ int main(int argc, char **argv) {
              iters - 1, num_rays);
 
     double ms_range_sensor = 0.0;
+    double ms_gpu_cast = IS_GPU_METHOD ? 0.0 : -1.0;
+    double ms_weighting = IS_GPU_METHOD ? 0.0 : -1.0;
     double ms_squash = 0.0;
     double ms_normalize = 0.0;
     long distinct_triples = 0;
@@ -1460,10 +1508,19 @@ int main(int argc, char **argv) {
           measurement_update(method, sensor_table, table_width, particles,
                              angles, obs, new_weights, ranges, max_particles,
                              num_rays,
-                             !disable_working_set_stats, distinct_triples);
-      if (!avg_mode)
-        log_iter("[iter %d/%d] measurement update: %.3f ms (distinct_triples=%ld)\n",
-                 iter, iters - 1, ms_range_sensor, distinct_triples);
+                             !disable_working_set_stats, distinct_triples,
+                             ms_gpu_cast, ms_weighting);
+      if (!avg_mode) {
+        if (IS_GPU_METHOD)
+          log_iter("[iter %d/%d] measurement update: %.3f ms (gpu_cast=%.3f "
+                   "weighting=%.3f, distinct_triples=%ld)\n",
+                   iter, iters - 1, ms_range_sensor, ms_gpu_cast, ms_weighting,
+                   distinct_triples);
+        else
+          log_iter("[iter %d/%d] measurement update: %.3f ms "
+                   "(distinct_triples=%ld)\n",
+                   iter, iters - 1, ms_range_sensor, distinct_triples);
+      }
 
       auto t_squash0 = Clock::now();
       squash_weights(new_weights, max_particles, squash_factor);
@@ -1494,7 +1551,8 @@ int main(int argc, char **argv) {
     if (f_particles)
       log_particles(f_particles, iter, particles, weights, max_particles);
     log_timing_row(f_timing, iter, distinct_cells, mean_dist_to_true, stddev_x,
-                   stddev_y, ms_range_sensor, ess, distinct_triples);
+                   stddev_y, ms_range_sensor, ess, distinct_triples,
+                   ms_gpu_cast, ms_weighting);
     log_iter("[iter %d/%d] logged particles + timing rows\n", iter,
              iters - 1);
 
@@ -1553,6 +1611,8 @@ int main(int argc, char **argv) {
                         ms_normalize + ms_ess + ms_resample;
       sum_ms_motion += ms_motion;
       sum_ms_range_sensor += ms_range_sensor;
+      sum_ms_gpu_cast += ms_gpu_cast;
+      sum_ms_weighting += ms_weighting;
       sum_ms_squash += ms_squash;
       sum_ms_normalize += ms_normalize;
       sum_ms_ess += ms_ess;
@@ -1581,6 +1641,13 @@ int main(int argc, char **argv) {
       std::printf("%-24s %12.4f\n", "motion", sum_ms_motion / avg_count);
       std::printf("%-24s %12.4f\n", "measurement_update",
                   sum_ms_range_sensor / avg_count);
+      // Sub-split of measurement_update (already counted in it -- NOT added
+      // to the total again). GPU methods only, see measurement_update.
+      if (IS_GPU_METHOD) {
+        std::printf("%-24s %12.4f\n", "  gpu_cast", sum_ms_gpu_cast / avg_count);
+        std::printf("%-24s %12.4f\n", "  weighting",
+                    sum_ms_weighting / avg_count);
+      }
       std::printf("%-24s %12.4f\n", "squash", sum_ms_squash / avg_count);
       std::printf("%-24s %12.4f\n", "normalize", sum_ms_normalize / avg_count);
       std::printf("%-24s %12.4f\n", "ess", sum_ms_ess / avg_count);
