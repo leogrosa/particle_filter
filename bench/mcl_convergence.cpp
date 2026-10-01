@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <memory>
 #include <random>
 #include <set>
 #include <sstream>
@@ -579,6 +580,75 @@ static const float *gpu_cast_all(MethodT &gpu,
   return ranges.data();
 #endif
 }
+
+// The GPU builds' sensor-table pass over already-cast ranges, on the CPU --
+// the default weighting, and the reference for gpu_weighting_parity_check.
+// Same arithmetic as the fused CPU-method loop in measurement_update.
+static void cpu_weight_from_ranges(const float *cast,
+                                   const std::vector<float> &obs,
+                                   const std::vector<double> &sensor_table,
+                                   int table_width,
+                                   std::vector<double> &new_weights, int n,
+                                   int num_rays) {
+  for (int i = 0; i < n; ++i) {
+    double weight = 1.0;
+    for (int a = 0; a < num_rays; ++a) {
+      float d = cast[i * num_rays + a];
+      float r = obs[a];
+      r = std::min(std::max(r, 0.0f), (float)table_width - 1.0f);
+      d = std::min(std::max(d, 0.0f), (float)table_width - 1.0f);
+      weight *= sensor_table[(int)r * table_width + (int)d];
+    }
+    new_weights[i] = weight;
+  }
+}
+
+#if GPU_UNIFIED == 1
+// --gpu-weighting: the same pass as cpu_weight_from_ranges, as a
+// one-thread-per-particle kernel (SensorModelCUDA, kernels.cu). `cast` is
+// gpu_cast_all's managed output, read in place -- the ranges never go through
+// the CPU. obs goes in and the weights come out through small managed buffers
+// (num_rays floats / n doubles); the copy-out keeps the rest of the pipeline
+// (squash, normalize) on new_weights, unchanged.
+static void gpu_weight_all(SensorModelCUDA &sm, const float *cast,
+                           const std::vector<float> &obs,
+                           std::vector<double> &new_weights, int n,
+                           int num_rays) {
+  // Same grow-on-demand, never-freed pattern as gpu_cast_all's buffers.
+  static float *um_obs = nullptr;
+  static double *um_weights = nullptr;
+  static size_t um_obs_cap = 0, um_weights_cap = 0;
+  if ((size_t)num_rays > um_obs_cap) {
+    if (um_obs)
+      cuda_managed_free(um_obs);
+    um_obs = cuda_managed_alloc_floats(num_rays);
+    um_obs_cap = num_rays;
+  }
+  if ((size_t)n > um_weights_cap) {
+    if (um_weights)
+      cuda_managed_free(um_weights);
+    um_weights = cuda_managed_alloc_doubles(n);
+    um_weights_cap = n;
+  }
+  if (!um_obs || !um_weights) {
+    std::fprintf(stderr, "managed allocation failed\n");
+    std::exit(1);
+  }
+  // Safe to write: gpu_cast_all returned only after its last launch finished.
+  std::copy(obs.begin(), obs.begin() + num_rays, um_obs);
+  sm.eval_weights_unified(cast, um_obs, um_weights, n, num_rays);
+  std::copy(um_weights, um_weights + n, new_weights.begin());
+}
+#endif
+#endif
+
+// What measurement_update takes for --gpu-weighting: the real SensorModelCUDA
+// in the _um GPU builds, an empty placeholder elsewhere (always passed as
+// nullptr there, i.e. CPU weighting).
+#if IS_GPU_METHOD && GPU_UNIFIED == 1
+using GpuWeighterT = SensorModelCUDA;
+#else
+struct GpuWeighterT {};
 #endif
 
 static double
@@ -588,7 +658,7 @@ measurement_update(MethodT &method, const std::vector<double> &sensor_table,
                    std::vector<double> &new_weights, std::vector<float> &ranges,
                    int n, int num_rays, bool track_distinct_triples,
                    long &distinct_triples, double &ms_gpu_cast,
-                   double &ms_weighting) {
+                   double &ms_weighting, GpuWeighterT *gpu_weighting) {
   // track_distinct_triples gates compute_distinct_triples entirely -- see
   // the comment on compute_working_set_stats above. This one matters far
   // more: its unordered_set can hold up to n*num_rays entries (vs.
@@ -618,7 +688,8 @@ measurement_update(MethodT &method, const std::vector<double> &sensor_table,
   //
   // That separation makes a clean sub-split possible: ms_gpu_cast is
   // gpu_cast_all (input rewrite + kernel launches + copies in the copy build),
-  // ms_weighting the CPU sensor-table pass. The cut point is valid because
+  // ms_weighting the sensor-table pass (CPU by default, GPU kernel + the
+  // obs/weights copies under --gpu-weighting). The cut point is valid because
   // gpu_cast_all only returns once every launch has finished (copy build: the
   // blocking cudaMemcpy back; unified build: the per-chunk
   // cudaDeviceSynchronize). Caveat for the unified build: any cost of the
@@ -627,17 +698,15 @@ measurement_update(MethodT &method, const std::vector<double> &sensor_table,
   const float *cast =
       gpu_cast_all(method, particles, angles, ranges, n, num_rays);
   auto t_cast = Clock::now();
-  for (int i = 0; i < n; ++i) {
-    double weight = 1.0;
-    for (int a = 0; a < num_rays; ++a) {
-      float d = cast[i * num_rays + a];
-      float r = obs[a];
-      r = std::min(std::max(r, 0.0f), (float)table_width - 1.0f);
-      d = std::min(std::max(d, 0.0f), (float)table_width - 1.0f);
-      weight *= sensor_table[(int)r * table_width + (int)d];
-    }
-    new_weights[i] = weight;
-  }
+#if GPU_UNIFIED == 1
+  if (gpu_weighting)
+    gpu_weight_all(*gpu_weighting, cast, obs, new_weights, n, num_rays);
+  else
+#else
+  (void)gpu_weighting;
+#endif
+    cpu_weight_from_ranges(cast, obs, sensor_table, table_width, new_weights,
+                           n, num_rays);
   auto t1 = Clock::now();
   ms_gpu_cast = std::chrono::duration<double, std::milli>(t_cast - t0).count();
   ms_weighting = std::chrono::duration<double, std::milli>(t1 - t_cast).count();
@@ -648,6 +717,7 @@ measurement_update(MethodT &method, const std::vector<double> &sensor_table,
   // the very access pattern being measured.
   ms_gpu_cast = -1.0;
   ms_weighting = -1.0;
+  (void)gpu_weighting;
   for (int i = 0; i < n; ++i) {
     float px = particles[i * 3 + 0];
     float py = particles[i * 3 + 1];
@@ -712,6 +782,47 @@ static void gpu_parity_check(MethodT &gpu, RefFn ref, const char *ref_name,
                 METHOD_NAME, ref_name, METHOD_NAME);
   std::fflush(stdout);
 }
+
+#if GPU_UNIFIED == 1
+// One-time, untimed check for --gpu-weighting: weight the initial population
+// from the same cast ranges both ways (CPU loop vs kernel) and compare. Same
+// table, same clamps, same multiplication order, so a match should be exact up
+// to the odd last-bit rounding; anything bigger is an indexing/layout bug.
+static void gpu_weighting_parity_check(MethodT &gpu, SensorModelCUDA &sm,
+                                       std::vector<float> &particles,
+                                       std::vector<float> &angles,
+                                       const std::vector<float> &obs,
+                                       const std::vector<double> &sensor_table,
+                                       int table_width, int n, int num_rays) {
+  std::vector<float> unused;
+  const float *cast = gpu_cast_all(gpu, particles, angles, unused, n, num_rays);
+  std::vector<double> cpu_w(n), gpu_w(n);
+  cpu_weight_from_ranges(cast, obs, sensor_table, table_width, cpu_w, n,
+                         num_rays);
+  gpu_weight_all(sm, cast, obs, gpu_w, n, num_rays);
+  double max_rel = 0.0;
+  long not_identical = 0, over_tol = 0;
+  for (int i = 0; i < n; ++i) {
+    if (cpu_w[i] == gpu_w[i])
+      continue;
+    ++not_identical;
+    double denom = std::max(std::fabs(cpu_w[i]), std::fabs(gpu_w[i]));
+    double rel = std::fabs(cpu_w[i] - gpu_w[i]) / denom;
+    max_rel = std::max(max_rel, rel);
+    if (rel > 1e-9)
+      ++over_tol;
+  }
+  std::printf("[setup] gpu weighting parity vs CPU over %d particles: "
+              "%ld not bit-identical, max rel diff=%.3g\n",
+              n, not_identical, max_rel);
+  if (over_tol > 0)
+    std::printf("[setup] WARNING: %ld particles' GPU weights differ from CPU "
+                "by >1e-9 relative -- check the weighting kernel before "
+                "trusting --gpu-weighting timings\n",
+                over_tol);
+  std::fflush(stdout);
+}
+#endif
 #endif
 
 // Step: squash. The measurement update's raw weight is a product of
@@ -1015,6 +1126,12 @@ static void print_usage(const char *prog) {
       "always runs its (cheap)\n"
       "                parity check against CPU RM; CPU methods ignore this "
       "flag.\n"
+      "  --gpu-weighting  optional flag (no value), rmgpu_um/gltgpu_um only. "
+      "Runs the\n"
+      "                sensor-table weighting as a GPU kernel instead of the "
+      "CPU loop (default).\n"
+      "                Checked against the CPU loop on the initial particles at "
+      "[setup].\n"
       "  --disable-working-set-stats  optional flag (no value). Skips "
       "building the\n"
       "                distinct_cells/distinct_triples unordered_set "
@@ -1074,6 +1191,7 @@ int main(int argc, char **argv) {
   bool redraw_every_iter = false;
   bool disable_working_set_stats = false;
   bool parity_check = false;
+  bool gpu_weighting = false;
   std::string scenario = "converge";
   // Value-taking flags the user actually passed -- a --scenario preset only
   // fills in the ones NOT in here, so an explicit flag always wins.
@@ -1103,6 +1221,10 @@ int main(int argc, char **argv) {
     }
     if (arg == "--parity-check") {
       parity_check = true;
+      continue;
+    }
+    if (arg == "--gpu-weighting") {
+      gpu_weighting = true;
       continue;
     }
     if (i + 1 >= argc) {
@@ -1164,6 +1286,12 @@ int main(int argc, char **argv) {
   if (max_particles <= 0 || num_rays <= 0 || iters <= 0 || !have_seed ||
       out_prefix.empty()) {
     print_usage(argv[0]);
+    return 1;
+  }
+  if (gpu_weighting && !(IS_GPU_METHOD && GPU_UNIFIED == 1)) {
+    std::fprintf(stderr, "--gpu-weighting needs a unified-memory GPU build "
+                         "(rmgpu_um / gltgpu_um), this is %s\n",
+                 METHOD_NAME);
     return 1;
   }
   if (init_mode != "global" && init_mode != "tracking") {
@@ -1396,6 +1524,29 @@ int main(int argc, char **argv) {
   }
 #endif
 
+  std::unique_ptr<GpuWeighterT> gpu_weighter;
+#if IS_GPU_METHOD && GPU_UNIFIED == 1
+  if (gpu_weighting) {
+    gpu_weighter.reset(new SensorModelCUDA(sensor_table.data(), table_width));
+    std::printf("[setup] weighting: gpu kernel, %d blocks x %d threads/block "
+                "(one thread per particle, %d particles)\n",
+                (max_particles + NUM_THREADS - 1) / NUM_THREADS, NUM_THREADS,
+                max_particles);
+    std::fflush(stdout);
+    build_ground_truth_observation(obs_caster, trajectory[0], angles, obs,
+                                   num_rays);
+    gpu_weighting_parity_check(method, *gpu_weighter, particles, angles, obs,
+                               sensor_table, table_width, max_particles,
+                               num_rays);
+  } else
+#endif
+  {
+    std::printf("[setup] weighting: cpu, single-threaded (%s)\n",
+                IS_GPU_METHOD ? "separate pass after the gpu cast"
+                              : "fused per ray with the cast");
+    std::fflush(stdout);
+  }
+
   std::normal_distribution<float> noise_x(0.0f,
                                           motion_dispersion_x / MAP_RESOLUTION);
   std::normal_distribution<float> noise_y(0.0f,
@@ -1509,7 +1660,7 @@ int main(int argc, char **argv) {
                              angles, obs, new_weights, ranges, max_particles,
                              num_rays,
                              !disable_working_set_stats, distinct_triples,
-                             ms_gpu_cast, ms_weighting);
+                             ms_gpu_cast, ms_weighting, gpu_weighter.get());
       if (!avg_mode) {
         if (IS_GPU_METHOD)
           log_iter("[iter %d/%d] measurement update: %.3f ms (gpu_cast=%.3f "
