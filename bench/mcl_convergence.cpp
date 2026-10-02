@@ -651,6 +651,151 @@ using GpuWeighterT = SensorModelCUDA;
 struct GpuWeighterT {};
 #endif
 
+// --lut-layout / --prefetch-batch (CPU GLT only). flat == nullptr is the
+// default nested path, glt.calc_range() per ray, untouched. Otherwise the
+// lookup reads `flat` (GiantLUTCast::flat_lut(), GiantLUTCastGPU's layout),
+// whose address is pure arithmetic -- under the nested giant_lut the address
+// itself takes two dependent loads (the [x] and [x][y] vector headers), and
+// those can miss too. prefetch_batch > 0 is group prefetching on top of that:
+// see flat_lut_weight.
+struct CpuLutOpts {
+  const GiantLUTCast::lut_t *flat = nullptr;
+  int prefetch_batch = 0; // particles per batch, 0 = off
+};
+
+#if RANGE_METHOD == RANGE_METHOD_GLT
+// Flat index of one GLT query, or -1 where calc_range returns max_range (pose
+// off the map). Same bounds check, (int) truncation and discretize_theta as
+// GiantLUTCast::calc_range -- only the final read differs.
+static inline int32_t flat_lut_index(GiantLUTCast &glt, int width, int height,
+                                     int bins, float x, float y,
+                                     float heading) {
+  if (x < 0 || x >= width || y < 0 || y >= height)
+    return -1;
+  return ((int32_t)x * height + (int32_t)y) * bins +
+         glt.discretize_theta(heading);
+}
+
+static inline float flat_lut_range(GiantLUTCast &glt,
+                                   const GiantLUTCast::lut_t *flat,
+                                   int32_t idx) {
+  return idx < 0 ? glt.maxRange() : glt.lut_to_range(flat[idx]);
+}
+
+// Same sensor-table step as the nested loop in measurement_update.
+static inline double ray_weight(const std::vector<double> &sensor_table,
+                                int table_width, float d, float r) {
+  r = std::min(std::max(r, 0.0f), (float)table_width - 1.0f);
+  d = std::min(std::max(d, 0.0f), (float)table_width - 1.0f);
+  return sensor_table[(int)r * table_width + (int)d];
+}
+
+// The flat-layout measurement update. prefetch_batch == 0: the nested loop's
+// exact shape, just reading the flat table -- the control that separates the
+// layout's own effect from the prefetching's.
+//
+// prefetch_batch == B > 0: group prefetching, B particles (B*num_rays
+// lookups) at a time, in two phases. Phase 1 computes every address in the
+// batch and issues a prefetch for each as soon as it's known; phase 2 does
+// the real lookups + weighting, which should then hit in cache. Nothing is
+// guessed -- the addresses are exact. It has to be a prefetch, not a plain
+// load: a load can't retire until its data arrives, so ~a ROB's worth of
+// missing loads stalls the core (the OoO-window limit this is meant to get
+// around), while a prefetch (PRFM) retires immediately. B is still a knob:
+// too big and phase 1's lines are evicted before phase 2 reads them (60 rays
+// ~ 3.8 KB of lines per particle vs. 32 KB L1D / 2 MB L2), or the core runs
+// out of miss slots and drops prefetches (PRFM is only a hint).
+static void flat_lut_weight(GiantLUTCast &glt, const CpuLutOpts &opts,
+                            const std::vector<double> &sensor_table,
+                            int table_width,
+                            const std::vector<float> &particles,
+                            const std::vector<float> &angles,
+                            const std::vector<float> &obs,
+                            std::vector<double> &new_weights, int n,
+                            int num_rays) {
+  const GiantLUTCast::lut_t *flat = opts.flat;
+  const int width = glt.getMap()->width, height = glt.getMap()->height;
+  const int bins = glt.theta_bins();
+  const int B = opts.prefetch_batch;
+
+  if (B == 0) {
+    for (int i = 0; i < n; ++i) {
+      float px = particles[i * 3 + 0];
+      float py = particles[i * 3 + 1];
+      float ptheta = particles[i * 3 + 2];
+      double weight = 1.0;
+      for (int a = 0; a < num_rays; ++a) {
+        int32_t idx = flat_lut_index(glt, width, height, bins, px, py,
+                                     ptheta + angles[a]);
+        weight *= ray_weight(sensor_table, table_width,
+                             flat_lut_range(glt, flat, idx), obs[a]);
+      }
+      new_weights[i] = weight;
+    }
+    return;
+  }
+
+  // Phase 1 -> phase 2 hand-off. int32 to keep it small: it shares L1 with
+  // the very lines phase 1 is pulling in.
+  static std::vector<int32_t> idx_buf;
+  idx_buf.resize((size_t)B * num_rays);
+  for (int i0 = 0; i0 < n; i0 += B) {
+    const int i1 = std::min(n, i0 + B);
+    int32_t *p = idx_buf.data();
+    for (int i = i0; i < i1; ++i) {
+      float px = particles[i * 3 + 0];
+      float py = particles[i * 3 + 1];
+      float ptheta = particles[i * 3 + 2];
+      for (int a = 0; a < num_rays; ++a) {
+        int32_t idx = flat_lut_index(glt, width, height, bins, px, py,
+                                     ptheta + angles[a]);
+        *p++ = idx;
+        if (idx >= 0)
+          __builtin_prefetch(flat + idx, 0 /* read */, 3 /* keep in L1 */);
+      }
+    }
+    p = idx_buf.data();
+    for (int i = i0; i < i1; ++i) {
+      double weight = 1.0;
+      for (int a = 0; a < num_rays; ++a)
+        weight *= ray_weight(sensor_table, table_width,
+                             flat_lut_range(glt, flat, *p++), obs[a]);
+      new_weights[i] = weight;
+    }
+  }
+}
+
+// One-time, untimed: the flat lookup must reproduce calc_range bit for bit
+// on the initial particles (same arithmetic, so any mismatch is a bug).
+static void flat_lut_parity_check(GiantLUTCast &glt,
+                                  const GiantLUTCast::lut_t *flat,
+                                  const std::vector<float> &particles,
+                                  const std::vector<float> &angles, int n,
+                                  int num_rays) {
+  const int width = glt.getMap()->width, height = glt.getMap()->height;
+  long mismatches = 0;
+  for (int i = 0; i < n; ++i) {
+    float px = particles[i * 3 + 0];
+    float py = particles[i * 3 + 1];
+    float ptheta = particles[i * 3 + 2];
+    for (int a = 0; a < num_rays; ++a) {
+      float h = ptheta + angles[a];
+      int32_t idx =
+          flat_lut_index(glt, width, height, glt.theta_bins(), px, py, h);
+      if (flat_lut_range(glt, flat, idx) != glt.calc_range(px, py, h))
+        ++mismatches;
+    }
+  }
+  std::printf("[setup] flat lut parity vs calc_range over %ld rays: %ld "
+              "mismatch(es)\n",
+              (long)n * num_rays, mismatches);
+  if (mismatches)
+    std::printf("[setup] WARNING: flat lut disagrees with calc_range -- "
+                "don't trust --lut-layout flat timings\n");
+  std::fflush(stdout);
+}
+#endif
+
 static double
 measurement_update(MethodT &method, const std::vector<double> &sensor_table,
                    int table_width, std::vector<float> &particles,
@@ -658,7 +803,8 @@ measurement_update(MethodT &method, const std::vector<double> &sensor_table,
                    std::vector<double> &new_weights, std::vector<float> &ranges,
                    int n, int num_rays, bool track_distinct_triples,
                    long &distinct_triples, double &ms_gpu_cast,
-                   double &ms_weighting, GpuWeighterT *gpu_weighting) {
+                   double &ms_weighting, GpuWeighterT *gpu_weighting,
+                   const CpuLutOpts &lut_opts) {
   // track_distinct_triples gates compute_distinct_triples entirely -- see
   // the comment on compute_working_set_stats above. This one matters far
   // more: its unordered_set can hold up to n*num_rays entries (vs.
@@ -695,6 +841,7 @@ measurement_update(MethodT &method, const std::vector<double> &sensor_table,
   // cudaDeviceSynchronize). Caveat for the unified build: any cost of the
   // CPU's first touch of the managed output buffer after the kernel lands in
   // ms_weighting, not ms_gpu_cast.
+  (void)lut_opts;
   const float *cast =
       gpu_cast_all(method, particles, angles, ranges, n, num_rays);
   auto t_cast = Clock::now();
@@ -718,6 +865,16 @@ measurement_update(MethodT &method, const std::vector<double> &sensor_table,
   ms_gpu_cast = -1.0;
   ms_weighting = -1.0;
   (void)gpu_weighting;
+#if RANGE_METHOD == RANGE_METHOD_GLT
+  if (lut_opts.flat) {
+    flat_lut_weight(method, lut_opts, sensor_table, table_width, particles,
+                    angles, obs, new_weights, n, num_rays);
+    auto t1 = Clock::now();
+    return std::chrono::duration<double, std::milli>(t1 - t0).count();
+  }
+#else
+  (void)lut_opts;
+#endif
   for (int i = 0; i < n; ++i) {
     float px = particles[i * 3 + 0];
     float py = particles[i * 3 + 1];
@@ -1132,6 +1289,21 @@ static void print_usage(const char *prog) {
       "CPU loop (default).\n"
       "                Checked against the CPU loop on the initial particles at "
       "[setup].\n"
+      "  --lut-layout  nested|flat (default nested), CPU GLT only. flat reads a "
+      "contiguous\n"
+      "                copy of the LUT ((x*height + y)*bins + theta_bin, "
+      "GiantLUTCastGPU's\n"
+      "                layout), so each lookup address is pure arithmetic "
+      "instead of two\n"
+      "                dependent loads through nested vector headers. "
+      "Checked against\n"
+      "                calc_range on the initial particles at [setup].\n"
+      "  --prefetch-batch  N particles (default 0 = off), needs --lut-layout "
+      "flat. Group\n"
+      "                prefetching: compute + prefetch all N*rays lookup "
+      "addresses, then\n"
+      "                do the lookups and weighting. --lut-layout flat with 0 "
+      "is the control.\n"
       "  --disable-working-set-stats  optional flag (no value). Skips "
       "building the\n"
       "                distinct_cells/distinct_triples unordered_set "
@@ -1192,6 +1364,8 @@ int main(int argc, char **argv) {
   bool disable_working_set_stats = false;
   bool parity_check = false;
   bool gpu_weighting = false;
+  std::string lut_layout = "nested";
+  int prefetch_batch = 0;
   std::string scenario = "converge";
   // Value-taking flags the user actually passed -- a --scenario preset only
   // fills in the ones NOT in here, so an explicit flag always wins.
@@ -1238,6 +1412,10 @@ int main(int argc, char **argv) {
       scenario = value;
     else if (arg == "--particles")
       max_particles = std::atoi(value);
+    else if (arg == "--lut-layout")
+      lut_layout = value;
+    else if (arg == "--prefetch-batch")
+      prefetch_batch = std::atoi(value);
     else if (arg == "--rays")
       num_rays = std::atoi(value);
     else if (arg == "--iters")
@@ -1291,6 +1469,21 @@ int main(int argc, char **argv) {
   if (gpu_weighting && !(IS_GPU_METHOD && GPU_UNIFIED == 1)) {
     std::fprintf(stderr, "--gpu-weighting needs a unified-memory GPU build "
                          "(rmgpu_um / gltgpu_um), this is %s\n",
+                 METHOD_NAME);
+    return 1;
+  }
+  if (lut_layout != "nested" && lut_layout != "flat") {
+    std::fprintf(stderr, "--lut-layout must be 'nested' or 'flat', got: %s\n",
+                 lut_layout.c_str());
+    return 1;
+  }
+  if (prefetch_batch < 0 || (prefetch_batch > 0 && lut_layout != "flat")) {
+    std::fprintf(stderr, "--prefetch-batch needs a value >= 0, and > 0 only "
+                         "with --lut-layout flat\n");
+    return 1;
+  }
+  if (lut_layout == "flat" && RANGE_METHOD != RANGE_METHOD_GLT) {
+    std::fprintf(stderr, "--lut-layout flat is CPU GLT only, this is %s\n",
                  METHOD_NAME);
     return 1;
   }
@@ -1425,6 +1618,27 @@ int main(int argc, char **argv) {
 #endif
   std::fflush(stdout);
 
+  // Owns the --lut-layout flat copy; the nested giant_lut stays allocated
+  // (it's GiantLUTCast's own member) but is never read on the timed path.
+  CpuLutOpts lut_opts;
+#if RANGE_METHOD == RANGE_METHOD_GLT
+  std::vector<GiantLUTCast::lut_t> flat_lut;
+  if (lut_layout == "flat") {
+    flat_lut = method.flat_lut();
+    lut_opts.flat = flat_lut.data();
+    lut_opts.prefetch_batch = prefetch_batch;
+  }
+  if (prefetch_batch > 0)
+    std::printf("[setup] glt lut layout: flat (%.1f MB copy), group prefetch: "
+                "%d particle(s) = %d lookups per batch\n",
+                flat_lut.size() * sizeof(GiantLUTCast::lut_t) / 1e6,
+                prefetch_batch, prefetch_batch * num_rays);
+  else
+    std::printf("[setup] glt lut layout: %s, no prefetch\n",
+                lut_layout.c_str());
+  std::fflush(stdout);
+#endif
+
   std::mt19937 rng(seed);
   std::vector<float> angles = make_angles(num_rays);
 
@@ -1522,6 +1736,12 @@ int main(int argc, char **argv) {
                 "compare against a CPU GiantLUTCast)\n");
     std::fflush(stdout);
   }
+#endif
+
+#if RANGE_METHOD == RANGE_METHOD_GLT
+  if (lut_opts.flat)
+    flat_lut_parity_check(method, lut_opts.flat, particles, angles,
+                          max_particles, num_rays);
 #endif
 
   std::unique_ptr<GpuWeighterT> gpu_weighter;
@@ -1660,7 +1880,8 @@ int main(int argc, char **argv) {
                              angles, obs, new_weights, ranges, max_particles,
                              num_rays,
                              !disable_working_set_stats, distinct_triples,
-                             ms_gpu_cast, ms_weighting, gpu_weighter.get());
+                             ms_gpu_cast, ms_weighting, gpu_weighter.get(),
+                             lut_opts);
       if (!avg_mode) {
         if (IS_GPU_METHOD)
           log_iter("[iter %d/%d] measurement update: %.3f ms (gpu_cast=%.3f "
